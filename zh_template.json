@@ -1,0 +1,75 @@
+{
+  "file": "main.pdf",
+  "tex": "path/to/paper/main.tex",
+  "title_zh": "在这里填论文中文标题",
+  "items": [
+    {
+      "id": "Title",
+      "page": 1,
+      "lines": "L10",
+      "section": "标题",
+      "title": "论文标题",
+      "anchor": "Your Paper Title",
+      "en_preview": "Your Paper Title",
+      "zh": "在这里填论文中文标题",
+      "is_todo": false
+    },
+    {
+      "id": "Abstract",
+      "page": 1,
+      "lines": "L20-35",
+      "section": "摘要",
+      "title": "Abstract",
+      "anchor": "Abstract",
+      "en_preview": "First sentence of your abstract...",
+      "zh": "在这里填摘要的中文对照。",
+      "is_todo": false
+    },
+    {
+      "id": "1-P1",
+      "page": 1,
+      "lines": "L40-55",
+      "section": "§1 Introduction",
+      "title": "研究背景与动机",
+      "anchor": "1. Introduction",
+      "en_preview": "Opening sentence of Introduction...",
+      "zh": "引言第一段中文对照。",
+      "is_todo": false
+    },
+    {
+      "id": "Fig1",
+      "page": 2,
+      "lines": "L80-90",
+      "section": "图 1",
+      "title": "Figure 1：方法/动机总览图",
+      "kind": "figure",
+      "anchor": "Figure 1.",
+      "en_preview": "Overview of our method...",
+      "zh": "图 1 图注中文说明。",
+      "is_todo": false
+    },
+    {
+      "id": "Tab1",
+      "page": 3,
+      "lines": "L150-180",
+      "section": "表 1",
+      "title": "Table 1：主实验结果",
+      "kind": "table",
+      "anchor": "Table 1.",
+      "en_preview": "Main results across benchmarks...",
+      "zh": "表 1 表注与核心数据说明。",
+      "is_todo": false
+    },
+    {
+      "id": "Sec5-TODO",
+      "page": 6,
+      "lines": "L300",
+      "section": "§5 Conclusion",
+      "title": "结论（待写）",
+      "anchor": "5. Conclusion",
+      "en_preview": "5. Conclusion [TODO]",
+      "zh": "[TODO] 总结核心贡献与局限性。",
+      "is_todo": true
+    }
+  ]
+}
