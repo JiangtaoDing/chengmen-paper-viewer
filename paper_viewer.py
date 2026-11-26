@@ -12,12 +12,16 @@ import argparse
 import http.server
 import json
 import re
+import sys
 import threading
 import time
 import urllib.parse
 from pathlib import Path
 
 import pymupdf
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import paper_lock
 
 # Runtime configuration populated in main()
 PAPER_DIR: Path = Path.cwd()
@@ -39,16 +43,19 @@ ABBREVS = {
 }
 
 ZH_EN_HINTS = [
-    ("基线", "baseline"), ("消融", "ablation"), ("数据集", "dataset"), ("基准", "benchmark"),
-    ("准确率", "accuracy"), ("延迟", "latency"), ("时延", "latency"), ("开销", "cost"),
-    ("训练", "train"), ("推理", "inference"), ("微调", "fine-tun"), ("冻结", "frozen"),
-    ("注意力", "attention"), ("嵌入", "embedding"), ("线性", "linear"), ("向量", "vector"),
-    ("置零", "zero"), ("交换", "swap"), ("匹配", "match"), ("偏置", "bias"),
-    ("位置", "position"), ("门控", "gate"), ("对照", "control"), ("反事实", "counterfactual"),
-    ("对称", "symmetric"), ("不对称", "asymmetric"), ("词表", "vocabulary"), ("解码", "decod"),
-    ("离线", "offline"), ("在线", "online"), ("置信区间", "ci"), ("自助法", "bootstrap"),
-    ("附录", "appendix"), ("表格", "table"), ("图表", "figure"), ("实验", "experiment"),
-    ("方法", "method"), ("结论", "conclusion"), ("局限", "limitation"), ("预实验", "pilot"),
+    ("置零", "zero"), ("全零", "zero"), ("错配", "swap"), ("错配", "mism"),
+    ("交换", "swap"), ("匹配", "match"), ("循环", "circular"), ("轮转", "rotation"),
+    ("位置偏置", "position"), ("偏置", "bias"), ("自校正", "self-correction"),
+    ("预填充", "prefill"), ("门控", "gate"), ("对照", "control"), ("干扰", "distractor"),
+    ("支持", "support"), ("金标准", "gold"), ("翻转", "flip"), ("反事实", "counterfactual"),
+    ("对称", "symmetric"), ("不对称", "asymmetric"), ("透镜", "lens"), ("岭", "ridge"),
+    ("单向量", "single-vector"), ("单向量", "single vector"), ("单个向量", "single vector"),
+    ("词表", "vocabulary"), ("解码", "decod"), ("白盒", "white-box"),
+    ("离线", "offline"), ("在线", "online"), ("停止", "stops"), ("置信区间", "ci"),
+    ("自助法", "bootstrap"), ("平衡准确率", "balanced"), ("盲答", "blind"),
+    ("背景", "background"), ("私有", "private"), ("逐题", "item-level"),
+    ("融合器", "fuser"), ("任务能力", "competence"), ("判断", "judgment"),
+    ("预实验", "pilot"), ("直读", "direct-reading"),
 ]
 
 _ZH_SENT_RE = re.compile(r'[^\n。！？!?]+(?:[。！？!?]+[」”’）\)\]]*)?|\n+')
@@ -330,12 +337,33 @@ def build_regions(pdf_path: Path, pdf_mtime: float, zh_mtime: float, items: list
         float_anchors = [(it["id"], it.get("kind"), _item_anchor_phrase(it)) for it in float_items]
 
         page_dims: list[tuple[float, float]] = []
-        raw_blocks_per_page: list[list[tuple[float, float, float, float, str, str, int]]] = []
+        raw_blocks_per_page: list[list[tuple[float, float, float, float, str, str, int, float]]] = []
         words_by_page_bno: dict[tuple[int, int], list[tuple]] = {}
+        body_fs_samples: list[float] = []
 
         for p_idx, page in enumerate(doc):
             pw, ph = float(page.rect.width), float(page.rect.height)
             page_dims.append((pw, ph))
+            dict_blks = page.get_text("dict").get("blocks", [])
+            fs_by_bbox: dict[tuple[float, float, float, float], float] = {}
+            for db in dict_blks:
+                if db.get("type") != 0:
+                    continue
+                w_sum, c_sum = 0.0, 0
+                for ln in db.get("lines", []):
+                    for sp in ln.get("spans", []):
+                        st = sp.get("text", "").strip()
+                        if st:
+                            n_ch = len(st)
+                            w_sum += float(sp.get("size", 0.0)) * n_ch
+                            c_sum += n_ch
+                if c_sum > 0:
+                    fs_val = w_sum / c_sum
+                    bx0, by0, bx1, by1 = db["bbox"]
+                    fs_by_bbox[(round(bx0, 1), round(by0, 1), round(bx1, 1), round(by1, 1))] = fs_val
+                    if c_sum >= 120 and by0 >= ph * 0.08 and by1 <= ph * 0.90 and not _is_margin_line_number(bx0, bx1, "0", pw):
+                        body_fs_samples.append(fs_val)
+
             blks = []
             for b in page.get_text("blocks"):
                 x0, y0, x1, y1, txt, bno, btype = b
@@ -350,7 +378,8 @@ def build_regions(pdf_path: Path, pdf_mtime: float, zh_mtime: float, items: list
                 ntxt = _norm(txt)
                 if not ntxt:
                     continue
-                blks.append((x0, y0, x1, y1, txt, ntxt, int(bno)))
+                bfs = fs_by_bbox.get((round(x0, 1), round(y0, 1), round(x1, 1), round(y1, 1)), 0.0)
+                blks.append((x0, y0, x1, y1, txt, ntxt, int(bno), bfs))
             raw_blocks_per_page.append(blks)
 
             for w in page.get_text("words"):
@@ -360,6 +389,12 @@ def build_regions(pdf_path: Path, pdf_mtime: float, zh_mtime: float, items: list
                 words_by_page_bno.setdefault((p_idx, int(bno)), []).append(
                     (p_idx, float(wx0), float(wy0), float(wx1), float(wy1), str(wstr), int(bno), int(lno), int(wno))
                 )
+
+        if body_fs_samples:
+            body_fs_samples.sort()
+            body_fs = body_fs_samples[len(body_fs_samples) // 2]
+        else:
+            body_fs = 10.0
 
         for k_pb in words_by_page_bno:
             words_by_page_bno[k_pb].sort(key=lambda x: (x[7], x[8]))
@@ -396,8 +431,8 @@ def build_regions(pdf_path: Path, pdf_mtime: float, zh_mtime: float, items: list
                                 break
                             cap_end_y = max(cap_end_y, b[3])
                             cap_b_list.append((p_idx, b[6]))
-                    bx0 = pw * 0.08 if (is_wide or cy0 < ph * 0.46) else max(pw * 0.08, cx0 - 6.0)
-                    bx1 = pw * 0.92 if (is_wide or cy0 < ph * 0.46) else min(pw * 0.92, cx1 + 6.0)
+                    bx0 = pw * 0.08 if is_wide else max(pw * 0.08, cx0 - 6.0)
+                    bx1 = pw * 0.92 if is_wide else min(pw * 0.92, cx1 + 6.0)
                     prose_above = [
                         b[3] for b in blks
                         if b[3] < cy0 - 24
@@ -440,6 +475,8 @@ def build_regions(pdf_path: Path, pdf_mtime: float, zh_mtime: float, items: list
                     end_y = cy1
                     cap_end_y = cy1
                     still_in_caption = True
+                    seen_table_body = False
+                    col_w = max(1.0, col_right - col_left)
                     for b in below:
                         if b is cap_blk:
                             continue
@@ -449,16 +486,27 @@ def build_regions(pdf_path: Path, pdf_mtime: float, zh_mtime: float, items: list
                             break
                         if b[1] > end_y + 40:
                             break
+                        bfs = b[7]
+                        bw = b[2] - b[0]
+                        btxt_s = b[4].strip()
+                        # Stop before body-text prose paragraphs (e.g. cross-column continuations below a top-of-column table)
+                        if (not still_in_caption or b[1] > cap_end_y + 12) and bfs >= body_fs - 0.35 and (bw >= col_w * 0.55 or len(btxt_s) >= 45):
+                            break
+                        # Also stop if a large float-separation gap follows a table body and block is not a footnote
+                        if seen_table_body and b[1] > end_y + 16 and not btxt_s.startswith(("*", "∗", "†", "‡", "§", "◊", "Note", "note")):
+                            if bfs >= body_fs - 0.45:
+                                break
                         if still_in_caption and b[1] <= cap_end_y + 8 and (b[2] - b[0]) >= (cx1 - cx0) * 0.55:
                             cap_b_list.append((p_idx, b[6]))
                             cap_end_y = max(cap_end_y, b[3])
                         else:
                             still_in_caption = False
+                            seen_table_body = True
                         end_y = max(end_y, b[3])
                     float_boxes_per_page[p_idx].append((fid, (col_left, max(ph * 0.073, cy0 - 4.0), col_right, end_y + 6.0)))
                 item_blocks_by_id[fid] = cap_b_list
 
-        prose_stream: list[tuple[int, tuple[float, float, float, float, str, str, int]]] = []
+        prose_stream: list[tuple[int, tuple[float, float, float, float, str, str, int, float]]] = []
         for p_idx, blks in enumerate(raw_blocks_per_page):
             pw, ph = page_dims[p_idx]
             mid = pw / 2.0
@@ -672,14 +720,67 @@ def get_meta(filename: str | None) -> dict:
     try:
         pages = [{"w": round(p.rect.width, 1), "h": round(p.rect.height, 1)} for p in doc]
         toc = [{"level": lvl, "title": title, "page": page} for lvl, title, page in doc.get_toc()]
+        try:
+            named_dests = doc.resolve_names() or {}
+        except Exception:
+            named_dests = {}
+        links_per_page: list[list[dict]] = []
+        n_pages = len(doc)
+        for p in doc:
+            pw, ph = float(p.rect.width) or 1.0, float(p.rect.height) or 1.0
+            plinks: list[dict] = []
+            for lnk in p.get_links():
+                fr = lnk.get("from")
+                if not fr:
+                    continue
+                rect_n = [
+                    round(max(0.0, fr.x0 / pw), 4),
+                    round(max(0.0, fr.y0 / ph), 4),
+                    round(min(1.0, fr.x1 / pw), 4),
+                    round(min(1.0, fr.y1 / ph), 4),
+                ]
+                kind = lnk.get("kind")
+                if kind == pymupdf.LINK_URI and lnk.get("uri"):
+                    uri = str(lnk["uri"]).strip()
+                    if uri.startswith(("http://", "https://", "mailto:")):
+                        plinks.append({"r": rect_n, "t": "uri", "u": uri})
+                elif kind in (pymupdf.LINK_GOTO, pymupdf.LINK_NAMED):
+                    dst_p = lnk.get("page")
+                    to_pt = lnk.get("to")
+                    ndest = str(lnk.get("nameddest") or "")
+                    is_pdf_bottom_up = (kind == pymupdf.LINK_NAMED)
+                    if (dst_p is None or dst_p < 0) and ndest and ndest in named_dests:
+                        resolved = named_dests[ndest]
+                        dst_p = resolved.get("page")
+                        to_pt = resolved.get("to")
+                        is_pdf_bottom_up = True
+                    if isinstance(dst_p, int) and 0 <= dst_p < n_pages:
+                        dpw = float(doc[dst_p].rect.width) or 1.0
+                        dph = float(doc[dst_p].rect.height) or 1.0
+                        tx, ty = 0.0, 0.0
+                        if to_pt is not None:
+                            try:
+                                raw_x = float(to_pt.x) if hasattr(to_pt, "x") else float(to_pt[0])
+                                raw_y = float(to_pt.y) if hasattr(to_pt, "y") else float(to_pt[1])
+                                tx = max(0.0, min(1.0, raw_x / dpw))
+                                y_top = (dph - raw_y) if is_pdf_bottom_up else raw_y
+                                ty = max(0.0, min(1.0, y_top / dph))
+                            except Exception:
+                                tx, ty = 0.0, 0.0
+                        entry = {"r": rect_n, "t": "goto", "p": dst_p + 1, "x": round(tx, 4), "y": round(ty, 4)}
+                        if ndest:
+                            entry["d"] = ndest
+                        plinks.append(entry)
+            links_per_page.append(plinks)
         info = {
             "file": path.name,
             "files": list_pdfs(),
-            "page_count": len(doc),
+            "page_count": n_pages,
             "mtime": mtime,
             "mtime_str": time.strftime("%H:%M:%S", time.localtime(mtime)),
             "pages": pages,
             "toc": toc,
+            "links": links_per_page,
         }
     finally:
         doc.close()
@@ -817,6 +918,10 @@ def get_zh_companion(filename: str | None) -> dict:
 
     items = [dict(it) for it in raw.get("items", [])]
     regions, sentence_map = build_regions(pdf_path, pdf_mtime, mtime, items)
+    lp = paper_lock.lock_path_for(pdf_path)
+    locks_mtime = lp.stat().st_mtime if lp.exists() else 0.0
+    ldata = paper_lock.load_locks(pdf_path)
+    locked_set = set((ldata.get("locks") or {}).keys())
     primary_page: dict[str, int] = {}
     for r in regions:
         primary_page.setdefault(r["id"], r["page"])
@@ -825,12 +930,17 @@ def get_zh_companion(filename: str | None) -> dict:
             it["page"] = primary_page[it["id"]]
         if it["id"] in sentence_map:
             it["sent_map"] = sentence_map[it["id"]]
+        it["section_group"] = paper_lock.section_group_key(it)
+        it["locked"] = it["id"] in locked_set
     return {
         "available": True,
         "file": resolved_name,
         "title_zh": raw.get("title_zh", ""),
         "mtime": mtime,
         "pdf_mtime": pdf_mtime,
+        "locks_mtime": locks_mtime,
+        "lock_mode": ldata.get("mode", "deny"),
+        "locked_ids": sorted(locked_set),
         "mtime_str": time.strftime("%H:%M:%S", time.localtime(mtime)),
         "items": items,
         "regions": regions,
@@ -1089,6 +1199,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
       cursor: grab;
     }
     .page-card.has-hover { cursor: pointer; }
+    .page-card.has-link-hover,
+    .page-card.has-link-hover .pdf-tl-span { cursor: pointer !important; }
+    #backJumpBtn:disabled { opacity: 0.36; cursor: default; }
+    #backJumpBtn:disabled:hover { background: var(--btn-bg); }
     .page-card img {
       display: block;
       width: 100%;
@@ -1157,6 +1271,32 @@ HTML_PAGE = r"""<!DOCTYPE html>
       pointer-events: none;
       mix-blend-mode: multiply;
       animation: sentPulse 0.38s ease-out;
+    }
+    .pdf-link-hover-box {
+      position: absolute;
+      background: rgba(59, 130, 246, 0.16);
+      border-bottom: 2px solid rgba(37, 99, 235, 0.95);
+      border-radius: 2px;
+      pointer-events: none;
+      mix-blend-mode: multiply;
+    }
+    .pdf-link-target-ring {
+      position: absolute;
+      width: 28px;
+      height: 28px;
+      margin-left: -14px;
+      margin-top: -14px;
+      border-radius: 50%;
+      border: 2.5px solid rgba(37, 99, 235, 0.92);
+      background: rgba(59, 130, 246, 0.18);
+      pointer-events: none;
+      box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.22);
+      animation: linkTargetPulse 1.25s ease-out forwards;
+    }
+    @keyframes linkTargetPulse {
+      0% { transform: scale(0.55); opacity: 1; }
+      45% { transform: scale(1.25); opacity: 0.92; }
+      100% { transform: scale(1.65); opacity: 0; }
     }
     @keyframes pdfFlashFade {
       0% { opacity: 1; background: rgba(59, 130, 246, 0.24); box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.28); }
@@ -1308,6 +1448,125 @@ HTML_PAGE = r"""<!DOCTYPE html>
     .zh-card.is-todo {
       border-left-color: var(--todo);
     }
+    .zh-card.is-locked {
+      border-color: #36506e;
+      border-left-color: #38bdf8;
+      background: #232b36;
+    }
+    .zh-card.is-locked.is-selected {
+      border-color: #38bdf8;
+      background: #263549;
+    }
+    .badge-lock {
+      background: rgba(56, 189, 248, 0.16);
+      color: #7dd3fc;
+      border: 1px solid rgba(56, 189, 248, 0.35);
+    }
+    .lock-card-btn {
+      height: 20px;
+      font-size: 10.5px;
+      padding: 0 6px;
+      background: transparent;
+      border: 1px solid #444956;
+      color: #a9b3c4;
+      margin-left: 4px;
+    }
+    .lock-card-btn:hover {
+      border-color: #38bdf8;
+      color: #e0f2fe;
+      background: rgba(56, 189, 248, 0.12);
+    }
+    .lock-card-btn.is-locked {
+      background: rgba(56, 189, 248, 0.18);
+      border-color: rgba(56, 189, 248, 0.65);
+      color: #7dd3fc;
+      font-weight: 600;
+    }
+    .lock-menu-wrap {
+      position: relative;
+      display: inline-flex;
+    }
+    .lock-popover {
+      display: none;
+      position: absolute;
+      right: 0;
+      top: 28px;
+      width: 268px;
+      background: #22262e;
+      border: 1px solid #424a59;
+      border-radius: 8px;
+      box-shadow: 0 10px 28px rgba(0, 0, 0, 0.55);
+      padding: 9px;
+      z-index: 80;
+    }
+    .lock-popover.open { display: block; }
+    .lock-pop-title {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 6px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .lock-mode-row {
+      display: flex;
+      gap: 4px;
+      margin-bottom: 8px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #333845;
+    }
+    .lock-mode-row button {
+      flex: 1;
+      height: 24px;
+      font-size: 11px;
+      padding: 0 6px;
+    }
+    .lock-mode-row button.active {
+      border-color: #38bdf8;
+      color: #7dd3fc;
+      background: rgba(56, 189, 248, 0.16);
+    }
+    .lock-sec-list {
+      max-height: 270px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .lock-sec-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      padding: 4px 6px;
+      border-radius: 5px;
+      background: #2a2f39;
+      font-size: 11.5px;
+    }
+    .lock-sec-row .sec-name {
+      font-weight: 600;
+      color: #dce4f2;
+    }
+    .lock-sec-row .sec-cnt {
+      font-size: 10.5px;
+      color: var(--muted);
+      margin-left: 4px;
+    }
+    .lock-sec-row button {
+      height: 21px;
+      font-size: 10.5px;
+      padding: 0 7px;
+    }
+    .lock-sec-row button.all-locked {
+      border-color: rgba(56, 189, 248, 0.6);
+      color: #7dd3fc;
+      background: rgba(56, 189, 248, 0.16);
+    }
+    .pdf-lock-rail {
+      position: absolute;
+      border-left: 2.5px solid rgba(56, 189, 248, 0.72);
+      pointer-events: none;
+    }
     .zh-card.flash-ring {
       animation: cardFlash 0.75s ease-out;
     }
@@ -1455,6 +1714,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <input id="pageInput" type="number" min="1" value="1" />
         <span class="muted">/ <span id="pageCount">-</span></span>
         <button id="nextBtn" title="下一页">▶</button>
+        <button id="backJumpBtn" disabled title="返回跳转前的位置 (Alt+←)">↩ 返回</button>
       </div>
       <div class="sep"></div>
       <div class="group">
@@ -1468,6 +1728,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="group">
         <button id="zhToggleBtn" class="active" title="显示或隐藏中文对照面板">中文对照</button>
         <button id="splitDirBtn" title="切换左右分栏 / 上下分栏">左右分栏</button>
+        <button id="pdfLockMarkBtn" title="默认关闭以防干扰 PDF 排版判断；开启后仅在锁定段左侧显示细竖条">PDF锁标</button>
       </div>
       <div class="sep"></div>
       <div class="group">
@@ -1496,11 +1757,29 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 <span>中文对照</span>
                 <span id="zhCountPill" class="pill">0 段</span>
               </div>
-              <span id="zhUpdatedAt" class="muted" style="font-size:11px;">同步 --:--:--</span>
+              <div style="display:flex;align-items:center;gap:6px;">
+                <div class="lock-menu-wrap">
+                  <button id="lockMenuBtn" style="height:22px;font-size:11px;padding:0 7px;" title="按整节一键锁定/解锁，或切换拦截模式">🔒 锁定管理 (0) ▾</button>
+                  <div id="lockPopover" class="lock-popover">
+                    <div class="lock-pop-title">
+                      <span>Agent 拦截模式</span>
+                      <span id="lockModeStatus" style="color:#7dd3fc;">硬锁禁改</span>
+                    </div>
+                    <div class="lock-mode-row">
+                      <button id="lockModeDenyBtn" class="active" title="严格禁止 Agent 改动任何已锁定段落，必须先在此解锁">🔒 硬锁禁改</button>
+                      <button id="lockModeAskBtn" title="Agent 碰触锁定段时强制弹窗向你申请批准">✋ 弹窗确认</button>
+                    </div>
+                    <div class="lock-pop-title"><span>按整节一键锁定 / 解锁</span></div>
+                    <div id="lockSecList" class="lock-sec-list"></div>
+                  </div>
+                </div>
+                <span id="zhUpdatedAt" class="muted" style="font-size:11px;">同步 --:--:--</span>
+              </div>
             </div>
             <div class="zh-controls">
               <button id="filterAllBtn" class="active" data-filter="all">全部</button>
               <button id="filterPageBtn" data-filter="page">仅当前页 (P1)</button>
+              <button id="filterLockedBtn" data-filter="locked">仅已锁 (0)</button>
               <button id="filterTodoBtn" data-filter="todo">仅待写</button>
               <button id="autoSyncBtn" class="active" title="滚动 PDF 时自动高亮并滚动到对应中文段落">跟随</button>
               <input id="zhFilterInput" class="zh-filter-input" type="text" placeholder="筛编号/中文..." />
@@ -1536,18 +1815,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
     let regionsById = {};
     let itemById = {};
     let enSentRectsByPage = {}; // page -> [{ itemId, enIdx, zhIndices, rect }]
+    let pdfLinksByPage = {};    // page -> [{ r:[x0,y0,x1,y1], t:'goto'|'uri', p?, x?, y?, d?, u? }]
+    let hoveredPdfLink = null;  // { page, link }
+    let jumpHistory = [];       // [{ scrollTop, scrollLeft, page, zhScroll, selectedZhId, activeSent }]
 
     let zhVisible = localStorage.getItem('paper_zh_visible') !== '0';
     let splitDir = localStorage.getItem('paper_split_dir') || (window.innerWidth < 760 ? 'col' : 'row');
     let zhFilterMode = localStorage.getItem('paper_zh_filter') || 'all';
     let autoFollow = localStorage.getItem('paper_zh_follow') !== '0';
+    let showPdfLockMarks = localStorage.getItem('paper_pdf_lock_marks') === '1';
     let suppressNextAutoFollow = false;
+    let lockedSet = new Set();
+    let lockMode = 'deny';
 
     const fileSelect = document.getElementById('fileSelect');
     const viewer = document.getElementById('viewer');
     const viewerInner = document.getElementById('viewerInner');
     const pageInput = document.getElementById('pageInput');
     const pageCountEl = document.getElementById('pageCount');
+    const backJumpBtn = document.getElementById('backJumpBtn');
     const zoomLabel = document.getElementById('zoomLabel');
     const fitBtn = document.getElementById('fitBtn');
     const updatedAt = document.getElementById('updatedAt');
@@ -1562,14 +1848,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const zhPane = document.getElementById('zhPane');
     const zhToggleBtn = document.getElementById('zhToggleBtn');
     const splitDirBtn = document.getElementById('splitDirBtn');
+    const pdfLockMarkBtn = document.getElementById('pdfLockMarkBtn');
     const zhList = document.getElementById('zhList');
     const zhCountPill = document.getElementById('zhCountPill');
     const zhUpdatedAt = document.getElementById('zhUpdatedAt');
     const filterAllBtn = document.getElementById('filterAllBtn');
     const filterPageBtn = document.getElementById('filterPageBtn');
+    const filterLockedBtn = document.getElementById('filterLockedBtn');
     const filterTodoBtn = document.getElementById('filterTodoBtn');
     const autoSyncBtn = document.getElementById('autoSyncBtn');
     const zhFilterInput = document.getElementById('zhFilterInput');
+    const lockMenuBtn = document.getElementById('lockMenuBtn');
+    const lockPopover = document.getElementById('lockPopover');
+    const lockModeStatus = document.getElementById('lockModeStatus');
+    const lockModeDenyBtn = document.getElementById('lockModeDenyBtn');
+    const lockModeAskBtn = document.getElementById('lockModeAskBtn');
+    const lockSecList = document.getElementById('lockSecList');
 
     let toastTimer = null;
     function showToast(msg) {
@@ -1584,6 +1878,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       regionsById = {};
       itemById = {};
       enSentRectsByPage = {};
+      lockedSet = new Set(Array.isArray(zh?.locked_ids) ? zh.locked_ids : []);
+      lockMode = zh?.lock_mode === 'force_ask' ? 'force_ask' : 'deny';
       if (!zh || !zh.available) return;
       (zh.items || []).forEach(it => {
         itemById[it.id] = it;
@@ -1676,24 +1972,223 @@ HTML_PAGE = r"""<!DOCTYPE html>
       return nearest;
     }
 
+    function indexMetaLinks(meta) {
+      pdfLinksByPage = {};
+      if (!meta || !Array.isArray(meta.links)) return;
+      meta.links.forEach((arr, idx) => {
+        if (Array.isArray(arr) && arr.length) {
+          pdfLinksByPage[idx + 1] = arr;
+        }
+      });
+    }
+
+    function hitTestPdfLink(page, nx, ny) {
+      const list = pdfLinksByPage[page];
+      if (!list || !list.length) return null;
+      const padX = 0.0025;
+      const padY = 0.0018;
+      let best = null;
+      let bestArea = Infinity;
+      for (const lnk of list) {
+        const [x0, y0, x1, y1] = lnk.r;
+        if (nx >= x0 - padX && nx <= x1 + padX && ny >= y0 - padY && ny <= y1 + padY) {
+          const area = (x1 - x0) * (y1 - y0);
+          if (area < bestArea) {
+            best = lnk;
+            bestArea = area;
+          }
+        }
+      }
+      return best;
+    }
+
+    function formatPdfLinkLabel(lnk) {
+      if (!lnk) return '';
+      if (lnk.t === 'uri') {
+        return `🔗 打开链接 ${lnk.u}`;
+      }
+      const d = lnk.d || '';
+      const pg = `P${lnk.p}`;
+      if (d.startsWith('appendix.')) return `🔗 跳至 Appendix ${d.slice(9)} (${pg})`;
+      if (d.startsWith('section.')) return `🔗 跳至 Section ${d.slice(8)} (${pg})`;
+      if (d.startsWith('subsection.')) return `🔗 跳至 Section ${d.slice(11)} (${pg})`;
+      if (d.startsWith('subsubsection.')) return `🔗 跳至 Section ${d.slice(14)} (${pg})`;
+      if (d.startsWith('equation.')) return `🔗 跳至 Equation (${d.slice(9)}) (${pg})`;
+      if (d.startsWith('proposition.')) return `🔗 跳至 Proposition ${d.slice(12)} (${pg})`;
+      if (d.startsWith('theorem.')) return `🔗 跳至 Theorem ${d.slice(8)} (${pg})`;
+      if (d.startsWith('lemma.')) return `🔗 跳至 Lemma ${d.slice(6)} (${pg})`;
+      if (d.startsWith('table.')) return `🔗 跳至 Table (${pg})`;
+      if (d.startsWith('figure.')) return `🔗 跳至 Figure (${pg})`;
+      if (d.startsWith('cite.')) return `🔗 跳至参考文献 ${d.slice(5)} (${pg})`;
+      return `🔗 跳至第 ${lnk.p} 页`;
+    }
+
+    function updateBackJumpBtn() {
+      if (!backJumpBtn) return;
+      if (jumpHistory.length > 0) {
+        const last = jumpHistory[jumpHistory.length - 1];
+        backJumpBtn.disabled = false;
+        backJumpBtn.classList.add('active');
+        backJumpBtn.textContent = `↩ 返回 P${last.page}`;
+        backJumpBtn.title = `返回第 ${last.page} 页原位置 (Alt+←，共 ${jumpHistory.length} 步历史)`;
+      } else {
+        backJumpBtn.disabled = true;
+        backJumpBtn.classList.remove('active');
+        backJumpBtn.textContent = '↩ 返回';
+        backJumpBtn.title = '返回跳转前的位置 (Alt+←)';
+      }
+    }
+
+    function pushJumpHistory() {
+      jumpHistory.push({
+        scrollTop: viewer.scrollTop,
+        scrollLeft: viewer.scrollLeft,
+        page: currentPage,
+        zhScroll: zhList ? zhList.scrollTop : 0,
+        selectedZhId,
+        activeSent: activeSent ? {
+          itemId: activeSent.itemId,
+          zhIndices: [...activeSent.zhIndices],
+          enIndices: [...activeSent.enIndices],
+        } : null,
+      });
+      if (jumpHistory.length > 30) jumpHistory.shift();
+      updateBackJumpBtn();
+    }
+
+    function flashLinkTarget(pageNum, nx, ny) {
+      const pageCard = viewer.querySelector(`.page-card[data-page="${pageNum}"]`);
+      if (!pageCard) return;
+      const ov = pageCard.querySelector('.page-overlay');
+      if (!ov) return;
+      const { flashLayer } = ensureOverlayLayers(ov);
+      const ring = document.createElement('div');
+      ring.className = 'pdf-link-target-ring';
+      ring.style.left = (Math.max(0.03, Math.min(0.97, nx || 0.12)) * 100).toFixed(3) + '%';
+      ring.style.top = (Math.max(0.03, Math.min(0.97, ny || 0.08)) * 100).toFixed(3) + '%';
+      flashLayer.appendChild(ring);
+      setTimeout(() => { ring.remove(); }, 1350);
+    }
+
+    function jumpToPdfLink(lnk) {
+      if (!lnk) return;
+      if (lnk.t === 'uri' && lnk.u) {
+        window.open(lnk.u, '_blank', 'noopener,noreferrer');
+        return;
+      }
+      if (lnk.t !== 'goto' || !lnk.p) return;
+      pushJumpHistory();
+      const targetPage = Math.max(1, Math.min(currentMeta ? currentMeta.page_count : lnk.p, Number(lnk.p)));
+      const pageCard = viewer.querySelector(`.page-card[data-page="${targetPage}"]`);
+      suppressNextAutoFollow = true;
+      currentPage = targetPage;
+      pageInput.value = targetPage;
+      if (pageCard) {
+        const cardRect = pageCard.getBoundingClientRect();
+        const vRect = viewer.getBoundingClientRect();
+        const cardTopInViewer = cardRect.top - vRect.top + viewer.scrollTop;
+        const cardLeftInViewer = cardRect.left - vRect.left + viewer.scrollLeft;
+        const destY = cardTopInViewer + (lnk.y || 0) * pageCard.clientHeight - Math.max(36, viewer.clientHeight * 0.12);
+        const destX = viewer.scrollWidth > viewer.clientWidth + 4
+          ? Math.max(0, cardLeftInViewer + (lnk.x || 0) * pageCard.clientWidth - viewer.clientWidth * 0.18)
+          : 0;
+        viewer.scrollTo({ left: destX, top: Math.max(0, destY), behavior: 'smooth' });
+        flashLinkTarget(targetPage, lnk.x, lnk.y);
+      } else {
+        jumpToPage(targetPage);
+      }
+      highlightZhCards(true);
+      showToast(formatPdfLinkLabel(lnk) + '（点「↩ 返回」或按 Alt+← 可回到原处）');
+      setTimeout(() => { suppressNextAutoFollow = false; }, 750);
+    }
+
+    function goBackJump() {
+      if (!jumpHistory.length) return;
+      const prev = jumpHistory.pop();
+      updateBackJumpBtn();
+      suppressNextAutoFollow = true;
+      currentPage = prev.page;
+      pageInput.value = prev.page;
+      selectedZhId = prev.selectedZhId;
+      activeSent = prev.activeSent;
+      viewer.scrollTo({ left: prev.scrollLeft, top: prev.scrollTop, behavior: 'smooth' });
+      renderPdfOverlays();
+      highlightZhCards(false);
+      updateZhSentenceClasses();
+      if (zhList && typeof prev.zhScroll === 'number') {
+        zhList.scrollTo({ top: prev.zhScroll, behavior: 'smooth' });
+      }
+      showToast(`已返回第 ${prev.page} 页原位置`);
+      setTimeout(() => { suppressNextAutoFollow = false; }, 750);
+    }
+
+    function renderPdfLinkHoverOverlay() {
+      viewer.querySelectorAll('.page-card').forEach(card => {
+        const pg = Number(card.dataset.page);
+        const ov = card.querySelector('.page-overlay');
+        if (!ov) return;
+        const { linkLayer } = ensureOverlayLayers(ov);
+        linkLayer.innerHTML = '';
+        if (hoveredPdfLink && hoveredPdfLink.page === pg && hoveredPdfLink.link) {
+          const [x0, y0, x1, y1] = hoveredPdfLink.link.r;
+          const box = document.createElement('div');
+          box.className = 'pdf-link-hover-box';
+          box.style.left = (Math.max(0, x0 - 0.0015) * 100).toFixed(3) + '%';
+          box.style.top = (Math.max(0, y0 - 0.001) * 100).toFixed(3) + '%';
+          box.style.width = (Math.min(1, x1 - x0 + 0.003) * 100).toFixed(3) + '%';
+          box.style.height = (Math.min(1, y1 - y0 + 0.002) * 100).toFixed(3) + '%';
+          linkLayer.appendChild(box);
+        }
+      });
+    }
+
     function ensureOverlayLayers(ov) {
       let flashLayer = ov.querySelector('.ov-flash');
       if (!flashLayer) {
+        const lockLayer = document.createElement('div');
+        lockLayer.className = 'ov-lock';
         flashLayer = document.createElement('div');
         flashLayer.className = 'ov-flash';
         const hoverLayer = document.createElement('div');
         hoverLayer.className = 'ov-hover';
         const activeLayer = document.createElement('div');
         activeLayer.className = 'ov-active';
+        const linkLayer = document.createElement('div');
+        linkLayer.className = 'ov-link';
+        ov.appendChild(lockLayer);
         ov.appendChild(flashLayer);
         ov.appendChild(hoverLayer);
         ov.appendChild(activeLayer);
+        ov.appendChild(linkLayer);
       }
       return {
+        lockLayer: ov.querySelector('.ov-lock'),
         flashLayer: ov.querySelector('.ov-flash'),
         hoverLayer: ov.querySelector('.ov-hover'),
         activeLayer: ov.querySelector('.ov-active'),
+        linkLayer: ov.querySelector('.ov-link'),
       };
+    }
+
+    function renderPdfLockOverlays() {
+      viewer.querySelectorAll('.page-card').forEach(card => {
+        const pg = Number(card.dataset.page);
+        const ov = card.querySelector('.page-overlay');
+        if (!ov) return;
+        const { lockLayer } = ensureOverlayLayers(ov);
+        lockLayer.innerHTML = '';
+        if (!showPdfLockMarks || lockedSet.size === 0) return;
+        const regs = regionsByPage[pg] || [];
+        regs.forEach(r => {
+          if (!lockedSet.has(r.id)) return;
+          const rail = document.createElement('div');
+          rail.className = 'pdf-lock-rail';
+          rail.style.left = Math.max(0, (r.rect[0] * 100 - 0.6)) + '%';
+          rail.style.top = (r.rect[1] * 100) + '%';
+          rail.style.height = ((r.rect[3] - r.rect[1]) * 100) + '%';
+          lockLayer.appendChild(rail);
+        });
+      });
     }
 
     function flashPdfBlock(itemId) {
@@ -1768,8 +2263,96 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
 
     function renderPdfOverlays() {
+      renderPdfLockOverlays();
       renderPdfHoverOverlays();
       renderPdfActiveOverlays();
+    }
+
+    async function postLockAction(action, ids = [], mode = null) {
+      try {
+        const payload = { file: currentFile, action, ids };
+        if (mode) payload.mode = mode;
+        const res = await fetch('/api/locks', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) {
+          showToast('锁定更新失败: ' + (data.error || res.status));
+          return;
+        }
+        lockedSet = new Set(data.locked_ids || []);
+        lockMode = data.mode === 'force_ask' ? 'force_ask' : 'deny';
+        if (currentZh) {
+          currentZh.locked_ids = data.locked_ids || [];
+          currentZh.lock_mode = lockMode;
+          currentZh.locks_mtime = data.locks_mtime || Date.now() / 1000;
+          (currentZh.items || []).forEach(it => { it.locked = lockedSet.has(it.id); });
+        }
+        renderLockControls();
+        renderZhPane(true);
+        renderPdfLockOverlays();
+        if (action === 'set_mode') {
+          showToast(lockMode === 'deny' ? '已切换为：硬锁禁改模式（Agent 绝对无法修改锁定段）' : '已切换为：强询问模式（Agent 碰触锁定段时强制弹窗确认）');
+        } else {
+          const n = lockedSet.size;
+          showToast(`已更新锁定状态（当前共锁定 ${n} 处）`);
+        }
+      } catch (e) {
+        console.error(e);
+        showToast('锁定请求异常');
+      }
+    }
+
+    function renderLockControls() {
+      const nLocked = lockedSet.size;
+      if (lockMenuBtn) {
+        lockMenuBtn.textContent = `🔒 锁定管理 (${nLocked}) ▾`;
+        lockMenuBtn.classList.toggle('active', nLocked > 0);
+      }
+      if (filterLockedBtn) {
+        filterLockedBtn.textContent = `仅已锁 (${nLocked})`;
+      }
+      if (lockModeStatus) {
+        lockModeStatus.textContent = lockMode === 'deny' ? '硬锁禁改' : '弹窗确认';
+      }
+      if (lockModeDenyBtn) lockModeDenyBtn.classList.toggle('active', lockMode === 'deny');
+      if (lockModeAskBtn) lockModeAskBtn.classList.toggle('active', lockMode === 'force_ask');
+      if (pdfLockMarkBtn) pdfLockMarkBtn.classList.toggle('active', showPdfLockMarks);
+
+      if (!lockSecList || !currentZh || !currentZh.available) return;
+      const groups = [];
+      const gMap = {};
+      (currentZh.items || []).forEach(it => {
+        const g = it.section_group || '其他';
+        if (!gMap[g]) {
+          gMap[g] = [];
+          groups.push(g);
+        }
+        gMap[g].push(it.id);
+      });
+      lockSecList.innerHTML = '';
+      groups.forEach(g => {
+        const ids = gMap[g];
+        const cnt = ids.filter(id => lockedSet.has(id)).length;
+        const allLocked = cnt === ids.length && ids.length > 0;
+        const row = document.createElement('div');
+        row.className = 'lock-sec-row';
+        const left = document.createElement('div');
+        left.innerHTML = `<span class="sec-name"></span><span class="sec-cnt">${cnt}/${ids.length}</span>`;
+        left.querySelector('.sec-name').textContent = g;
+        const btn = document.createElement('button');
+        btn.className = allLocked ? 'all-locked' : '';
+        btn.textContent = allLocked ? '🔓 解锁整节' : '🔒 锁整节';
+        btn.onclick = (e) => {
+          e.stopPropagation();
+          postLockAction(allLocked ? 'unlock' : 'lock', ids);
+        };
+        row.appendChild(left);
+        row.appendChild(btn);
+        lockSecList.appendChild(row);
+      });
     }
 
     function updateZhSentenceClasses() {
@@ -1976,6 +2559,32 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const rect = card.getBoundingClientRect();
         const nx = (e.clientX - rect.left) / rect.width;
         const ny = (e.clientY - rect.top) / rect.height;
+
+        const linkHit = (!panMode && !spaceHeld) ? hitTestPdfLink(pageNum, nx, ny) : null;
+        if (linkHit) {
+          card.classList.add('has-link-hover');
+          card.classList.add('has-hover');
+          const changedLink = !hoveredPdfLink || hoveredPdfLink.page !== pageNum || hoveredPdfLink.link !== linkHit;
+          if (changedLink) {
+            hoveredPdfLink = { page: pageNum, link: linkHit };
+            renderPdfLinkHoverOverlay();
+          }
+          hoverPill.textContent = formatPdfLinkLabel(linkHit);
+          hoverPill.style.display = 'block';
+          const px = Math.min(window.innerWidth - 290, e.clientX + 14);
+          const py = Math.min(window.innerHeight - 32, e.clientY + 14);
+          hoverPill.style.left = px + 'px';
+          hoverPill.style.top = py + 'px';
+          return;
+        }
+        if (hoveredPdfLink !== null) {
+          card.classList.remove('has-link-hover');
+          hoveredPdfLink = null;
+          renderPdfLinkHoverOverlay();
+        } else {
+          card.classList.remove('has-link-hover');
+        }
+
         const sentHit = hitTestSentence(pageNum, nx, ny);
         const hit = sentHit ? { id: sentHit.itemId } : hitTestRegion(pageNum, nx, ny);
         if (hit && itemById[hit.id]) {
@@ -2022,9 +2631,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       card.addEventListener('mouseleave', () => {
         card.classList.remove('has-hover');
+        card.classList.remove('has-link-hover');
         hoverPill.style.display = 'none';
         hoveredItemId = null;
         hoveredPage = null;
+        if (hoveredPdfLink !== null) {
+          hoveredPdfLink = null;
+          renderPdfLinkHoverOverlay();
+        }
         if (hoverSent !== null) {
           hoverSent = null;
           renderPdfHoverOverlays();
@@ -2039,6 +2653,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const rect = card.getBoundingClientRect();
         const nx = (e.clientX - rect.left) / rect.width;
         const ny = (e.clientY - rect.top) / rect.height;
+
+        if (!panMode && !spaceHeld) {
+          const linkHit = hitTestPdfLink(pageNum, nx, ny);
+          if (linkHit) {
+            e.preventDefault();
+            e.stopPropagation();
+            hoveredPdfLink = null;
+            renderPdfLinkHoverOverlay();
+            hoverPill.style.display = 'none';
+            jumpToPdfLink(linkHit);
+            return;
+          }
+        }
+
         const sentHit = hitTestSentence(pageNum, nx, ny);
         const hit = sentHit ? { id: sentHit.itemId } : hitTestRegion(pageNum, nx, ny);
         if (hit && itemById[hit.id]) {
@@ -2187,9 +2815,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const prevScroll = zhList.scrollTop;
       filterAllBtn.classList.toggle('active', zhFilterMode === 'all');
       filterPageBtn.classList.toggle('active', zhFilterMode === 'page');
+      if (filterLockedBtn) filterLockedBtn.classList.toggle('active', zhFilterMode === 'locked');
       filterTodoBtn.classList.toggle('active', zhFilterMode === 'todo');
       filterPageBtn.textContent = `仅当前页 (P${currentPage})`;
       autoSyncBtn.classList.toggle('active', autoFollow);
+      renderLockControls();
 
       if (!currentZh || !currentZh.available) {
         zhCountPill.textContent = '无';
@@ -2203,6 +2833,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const allItems = currentZh.items || [];
       const filtered = allItems.filter(item => {
         if (zhFilterMode === 'page' && Number(item.page) !== currentPage) return false;
+        if (zhFilterMode === 'locked' && !lockedSet.has(item.id)) return false;
         if (zhFilterMode === 'todo' && !item.is_todo) return false;
         if (q) {
           const hay = `${item.id} ${item.section} ${item.title} ${item.en_preview} ${item.zh} p${item.page}`.toLowerCase();
@@ -2219,6 +2850,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       const frag = document.createDocumentFragment();
       filtered.forEach(item => {
+        const isLocked = lockedSet.has(item.id);
         const card = document.createElement('article');
         card.className = 'zh-card';
         card.dataset.id = item.id;
@@ -2226,6 +2858,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (Number(item.page) === currentPage) card.classList.add('is-current-page');
         if (item.id === selectedZhId) card.classList.add('is-selected');
         if (item.is_todo) card.classList.add('is-todo');
+        if (isLocked) card.classList.add('is-locked');
 
         const metaRow = document.createElement('div');
         metaRow.className = 'zh-card-meta';
@@ -2268,6 +2901,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
           }
         };
         metaRow.appendChild(copyBtn);
+
+        const lockBtn = document.createElement('button');
+        lockBtn.className = 'lock-card-btn' + (isLocked ? ' is-locked' : '');
+        lockBtn.textContent = isLocked ? '🔒 已锁定' : '🔓 锁定';
+        lockBtn.title = isLocked ? '点击解锁：解锁后 Agent 才允许修改该段对应的 .tex 源码' : '点击锁定：锁定后 Agent 将被 Hook 拦截，无法擅自修改该段';
+        lockBtn.onclick = (e) => {
+          e.stopPropagation();
+          postLockAction('toggle', [item.id]);
+        };
+        metaRow.appendChild(lockBtn);
 
         const heading = document.createElement('div');
         heading.className = 'zh-card-heading';
@@ -2465,6 +3108,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (changed) {
           liveDot.classList.add('updating');
           currentMeta = meta;
+          indexMetaLinks(meta);
           syncFileDropdown(meta);
           pageCountEl.textContent = meta.page_count;
           pageInput.max = meta.page_count;
@@ -2487,6 +3131,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const changed = !currentZh
           || currentZh.mtime !== zh.mtime
           || currentZh.pdf_mtime !== zh.pdf_mtime
+          || currentZh.locks_mtime !== zh.locks_mtime
           || currentZh.available !== zh.available
           || currentZh.file !== zh.file;
         if (changed) {
@@ -2597,6 +3242,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     });
     document.getElementById('prevBtn').onclick = () => jumpToPage(Number(pageInput.value) - 1);
     document.getElementById('nextBtn').onclick = () => jumpToPage(Number(pageInput.value) + 1);
+    if (backJumpBtn) backJumpBtn.onclick = goBackJump;
     pageInput.addEventListener('change', () => jumpToPage(pageInput.value));
     document.getElementById('zoomInBtn').onclick = () => {
       const base = zoomMode === 'fit' ? (computePageWidth() / 760) : zoomScale;
@@ -2639,6 +3285,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
       if (e.code === 'Space' && document.activeElement?.tagName !== 'INPUT') {
         spaceHeld = true;
         updatePanCursorMode();
+      }
+      if (e.altKey && e.key === 'ArrowLeft') {
+        e.preventDefault();
+        goBackJump();
       }
     });
     window.addEventListener('keyup', (e) => {
@@ -2751,13 +3401,39 @@ HTML_PAGE = r"""<!DOCTYPE html>
       viewer.style.flex = '1 1 58%';
       applyLayoutState();
     };
-    [filterAllBtn, filterPageBtn, filterTodoBtn].forEach(btn => {
+    [filterAllBtn, filterPageBtn, filterLockedBtn, filterTodoBtn].forEach(btn => {
+      if (!btn) return;
       btn.onclick = () => {
         zhFilterMode = btn.dataset.filter;
         localStorage.setItem('paper_zh_filter', zhFilterMode);
         renderZhPane(false);
       };
     });
+    if (pdfLockMarkBtn) {
+      pdfLockMarkBtn.classList.toggle('active', showPdfLockMarks);
+      pdfLockMarkBtn.onclick = () => {
+        showPdfLockMarks = !showPdfLockMarks;
+        localStorage.setItem('paper_pdf_lock_marks', showPdfLockMarks ? '1' : '0');
+        pdfLockMarkBtn.classList.toggle('active', showPdfLockMarks);
+        renderPdfLockOverlays();
+        showToast(showPdfLockMarks ? '已开启左侧 PDF 细锁边条' : '已隐藏左侧 PDF 锁标（保持纯净 PDF 排版视图）');
+      };
+    }
+    if (lockMenuBtn && lockPopover) {
+      lockMenuBtn.onclick = (e) => {
+        e.stopPropagation();
+        lockPopover.classList.toggle('open');
+        if (lockPopover.classList.contains('open')) renderLockControls();
+      };
+      lockPopover.onclick = (e) => e.stopPropagation();
+      document.addEventListener('click', () => lockPopover.classList.remove('open'));
+    }
+    if (lockModeDenyBtn) {
+      lockModeDenyBtn.onclick = () => postLockAction('set_mode', [], 'deny');
+    }
+    if (lockModeAskBtn) {
+      lockModeAskBtn.onclick = () => postLockAction('set_mode', [], 'force_ask');
+    }
     autoSyncBtn.onclick = () => {
       autoFollow = !autoFollow;
       localStorage.setItem('paper_zh_follow', autoFollow ? '1' : '0');
@@ -2822,6 +3498,19 @@ class ViewerHandler(http.server.BaseHTTPRequestHandler):
             elif parsed.path == "/api/zh":
                 data = get_zh_companion(file_param)
                 self._send(200, json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            elif parsed.path == "/api/locks":
+                pdf_path = resolve_pdf(file_param)
+                ldata = paper_lock.load_locks(pdf_path)
+                lp = paper_lock.lock_path_for(pdf_path)
+                out = {
+                    "file": pdf_path.name,
+                    "tex": ldata.get("tex", pdf_path.with_suffix(".tex").name),
+                    "mode": ldata.get("mode", "deny"),
+                    "locked_ids": sorted((ldata.get("locks") or {}).keys()),
+                    "locks": ldata.get("locks") or {},
+                    "locks_mtime": lp.stat().st_mtime if lp.exists() else 0.0,
+                }
+                self._send(200, json.dumps(out, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
             elif parsed.path == "/api/search":
                 q = qs.get("q", [""])[0]
                 matches = search_pdf(file_param, q)
@@ -2838,6 +3527,40 @@ class ViewerHandler(http.server.BaseHTTPRequestHandler):
                 self._send(404, b"Not Found", "text/plain")
         except Exception as e:
             self._send(500, str(e).encode("utf-8"), "text/plain; charset=utf-8")
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        try:
+            if parsed.path != "/api/locks":
+                self._send(404, b"Not Found", "text/plain")
+                return
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            body = self.rfile.read(length) if length > 0 else b"{}"
+            payload = json.loads(body.decode("utf-8"))
+            file_param = payload.get("file")
+            action = str(payload.get("action") or "toggle")
+            ids = payload.get("ids") or []
+            mode = payload.get("mode")
+
+            pdf_path = resolve_pdf(file_param)
+            zh_path = resolve_zh_path(pdf_path)
+            items = []
+            if zh_path and zh_path.exists():
+                items = json.loads(zh_path.read_text(encoding="utf-8")).get("items", [])
+
+            ldata = paper_lock.update_locks_for_pdf(pdf_path, items, action=action, ids=ids, mode=mode)
+            lp = paper_lock.lock_path_for(pdf_path)
+            out = {
+                "ok": True,
+                "file": pdf_path.name,
+                "tex": ldata.get("tex", pdf_path.with_suffix(".tex").name),
+                "mode": ldata.get("mode", "deny"),
+                "locked_ids": sorted((ldata.get("locks") or {}).keys()),
+                "locks_mtime": lp.stat().st_mtime if lp.exists() else 0.0,
+            }
+            self._send(200, json.dumps(out, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+        except Exception as e:
+            self._send(500, json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
 
 
 def parse_args() -> argparse.Namespace:

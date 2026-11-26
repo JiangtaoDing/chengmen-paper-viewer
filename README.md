@@ -1,26 +1,29 @@
 # Bilingual Live Paper Viewer (中英双栏实时矢量论文预览器)
 
-A lightweight, zero-intrusion **live bilingual preview & editing companion** for writing English LaTeX research papers (ICML / NeurIPS / ICLR / ACL / CVPR / IEEE, single-column or two-column).
+A lightweight, zero-intrusion **live bilingual preview, navigation, and lock-guarded co-writing toolkit** for writing English LaTeX research papers (ICML / NeurIPS / ICLR / ACL / CVPR / IEEE, single-column or two-column) — built for both human co-authors and AI coding agents.
 
-Render your compiled English `.pdf` on the left as **lossless vector SVG** (45%–500% zoom, drag-to-pan) while reading and revising synchronized **Chinese paragraph & sentence companions** on the right — without modifying a single line of your submission `.tex` template or leaving temporary files inside your LaTeX directory.
+Render your compiled English `.pdf` on the left as **lossless vector SVG** (with selectable/copyable English text and clickable PDF hyperlinks) while reading, aligning, and locking synchronized **Chinese paragraph & sentence companions** on the right — without touching a single line of your submission `.tex` template or polluting your LaTeX folder.
 
 ---
 
 ## Key Features / 核心特性
 
-1. **True Vector-SVG Rendering (45%–500% Lossless Zoom)**
-   - Renders every PDF page via PyMuPDF `get_svg_image(text_as_path=True)` so math symbols, vector figures, and tables remain razor-sharp at any zoom level with zero missing-font issues.
-   - Supports `Ctrl + Scroll` / trackpad pinch zoom centered on cursor and click-drag panning on the PDF pane.
-2. **Bidirectional Paragraph, Figure/Table, and Sentence-Level Sync**
-   - **Sentence-level highlighter (Right ↔ Left)**: Uses word-level PDF geometry and monotonic dynamic programming to align Chinese companion sentences with their exact English lines in the PDF. Hovering, clicking, or selecting text in Chinese highlights the corresponding English sentence lines with multiply-blended highlighter ink (`mix-blend-mode: multiply`), and vice versa.
-   - **Whole-paragraph & float regions**: Clicking a card header or any figure/table highlights the full block (including cross-column and cross-page continuations, stacked `[h]` figures, and `\onecolumn` appendices).
-3. **Automatic Hot Reload (~1.5 s)**
-   - Whenever `pdflatex` / `xelatex` updates `.pdf` or you/your AI assistant edits `*_zh.json`, the browser automatically refreshes while preserving scroll position and dynamically recomputing all page numbers and bounding boxes.
-4. **Revision-Focused Navigation & Filtering**
-   - Filter cards by **All (`全部`)**, **Current Page (`仅当前页`)**, **Pending (`仅待写 / TODO`)**, or **Follow (`跟随`)**, plus instant keyword search.
-   - One-click **Copy ID (`复制编号`)** (e.g., `2.2-P1 (L146-161)`) to reference exact paragraphs when collaborating with co-authors or AI coding assistants.
-5. **Zero Pollution of Your LaTeX Directory**
-   - Store the companion JSON outside your submission folder via `--zh` (or in `.paper_viewer/<stem>_zh.json`), keeping your submission zip spotless.
+1. **True Vector-SVG Rendering + Native English Text Selection (45%–500% Zoom)**
+   - Exports each PDF page via PyMuPDF `get_svg_image(text_as_path=True)` so math formulas, vector plots, and tables stay razor-sharp at any magnification with zero missing-font risk.
+   - Overlays an aligned transparent text layer so you can **drag-select and `Ctrl+C` copy English text** directly from the vector PDF (while auto-syncing the corresponding Chinese sentence!). Hold `Space` or toggle **`抓手`** (Hand Mode) to pan freely.
+2. **Clickable PDF Internal & External Hyperlinks + Multi-Step Back History**
+   - Automatically extracts PDF link annotations (`page.get_links()` + named destinations) so clicking `Appendix D`, `Section 4.5`, `Equation (2)`, `Table 1`, `Figure 3`, citations, or external URLs jumps directly to the exact destination with a target pulse ring and synced Chinese card.
+   - Includes a toolbar **`↩ 返回`** (Back) button and **`Alt + ←`** shortcut with multi-level jump history to return to your exact scroll position and highlight.
+3. **Bidirectional Paragraph, Figure/Table & Sentence-Level Sync**
+   - **Sentence-level highlighter (Right ↔ Left)**: Extracts word-level PDF geometry and aligns Chinese companion sentences to exact English lines via monotonic dynamic programming (or optional explicit `sent_align` overrides). Hovering, clicking, or drag-selecting in Chinese highlights the corresponding English lines in multiply-blended highlighter ink (`mix-blend-mode: multiply`), and vice versa.
+   - **Whole-paragraph & float regions**: Clicking a card header or any figure/table highlights the full block (including cross-column / cross-page continuations, stacked floats, and `\onecolumn` appendices).
+4. **Paragraph & Section Hard-Lock Guard for AI Co-Writing (`paper_lock.py`)**
+   - Lock any finalized paragraph, figure, table, or entire section with one click in the UI (`🔓 锁定` / `🔒 锁定管理`).
+   - Pair with an AI agent `PreToolUse` hook (`python path/to/paper_lock.py --hook`) supporting **`Hard Lock (deny)`** or **`Ask Approval (force_ask)`** modes so AI assistants never accidentally overwrite locked LaTeX spans or tamper with `.locks.json`.
+   - Optional subtle left-edge lock bars on the PDF (`PDF锁标`, off by default to keep typography inspection pure).
+5. **Automatic Hot Reload (~1.5 s) & Zero LaTeX Pollution**
+   - Whenever `pdflatex` / `xelatex` updates `.pdf` or you/your AI assistant edits `*_zh.json`, both panes hot-reload automatically while preserving scroll position and dynamically recomputing page numbers, bounding boxes, and hyperlinks.
+   - Keep `*_zh.json` outside your submission folder via `--zh` (or inside an ignored `.paper_viewer/` directory).
 
 ---
 
@@ -29,6 +32,7 @@ Render your compiled English `.pdf` on the left as **lossless vector SVG** (45%�
 | Path | Description |
 |---|---|
 | `paper_viewer.py` | Standalone local HTTP server (single-file Python + PyMuPDF, zero Node/npm build step) |
+| `paper_lock.py` | Paragraph/section lock engine + `PreToolUse` hook guard for AI coding agents |
 | `start_viewer.ps1` | Windows PowerShell launcher wrapper |
 | `zh_template.json` | Starter schema for a new paper's bilingual companion JSON |
 | `skill/bilingual-paper-workflow/SKILL.md` | Drop-in agent skill prompt for AI-assisted Edit–Compile–Sync paper writing |
@@ -65,11 +69,33 @@ Open `http://127.0.0.1:8788/` in your browser (or IDE side-pane browser).
 
 ---
 
-## AI-Assisted Edit–Compile–Sync Workflow / 配合 AI 写论文
+## AI-Assisted Co-Writing & Lock Hook / 配合 AI 协作与防误改锁
 
+### Agent Skill
 Copy `skill/bilingual-paper-workflow/SKILL.md` into your AI agent's skills directory (or paste the prompt below at the start of a writing session):
 
 > Please read `README.md` and `zh_template.json`, generate a paragraph-by-paragraph Chinese companion JSON for `<path/to/main.tex>` and `<path/to/main.pdf>`, launch `paper_viewer.py` on port `8788`, and keep the companion JSON synchronized whenever `.tex` is edited and recompiled.
+
+### Optional: Hard-Lock `PreToolUse` Hook (`paper_lock.py`)
+Register `paper_lock.py --hook` as a `PreToolUse` hook in your agent configuration (e.g., Antigravity / Claude Code) to enforce paragraph/section locks stored in `<stem>.locks.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "edit_file|write_file|run_command|Edit|Write|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"/abs/path/to/paper_lock.py\" --hook"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
 
 ---
 
@@ -93,6 +119,7 @@ See [`zh_template.json`](zh_template.json) for a full starter template:
       "anchor": "2.2. Empirical Analysis",
       "en_preview": "Opening words of the paragraph in the compiled PDF...",
       "zh": "这一段的流畅中文对照（可用 \\n 分段，保留关键数字与术语）。",
+      "sent_align": [[0], [1]],
       "is_todo": false
     }
   ]
@@ -103,6 +130,7 @@ See [`zh_template.json`](zh_template.json) for a full starter template:
 - **`id`** *(required, unique)*: Short reference tag (`Title`, `Abstract`, `1-P1`, `Fig1`, `Tab1`, `AppA-P1`). Setting `"id": "Title"` automatically binds to the title banner on Page 1.
 - **`kind`** *(optional)*: `"prose"` (default), `"figure"` (graphic above caption, e.g., `anchor: "Figure 1."`), or `"table"` (caption above table body, e.g., `anchor: "Table 1."`).
 - **`anchor`** *(recommended)*: First 4–8 English words appearing in the compiled PDF block (auto-derived from `en_preview` if omitted).
+- **`sent_align`** *(optional)*: Explicit mapping from each Chinese sentence index to English sentence index list(s) (e.g. `[[0], [1], [2, 3]]`); overrides automatic DP alignment when exact 1-to-1 alignment is desired.
 - **`page`**: Initial hint; dynamically updated from the live PDF on every compile.
 - **`is_todo`**: Marks unfinished sections with an amber badge and enables one-click `仅待写` filtering.
 
@@ -110,13 +138,13 @@ See [`zh_template.json`](zh_template.json) for a full starter template:
 
 ## Contributing / 欢迎共建
 
-Contributions, bug reports, and PRs are very welcome! Areas that are especially helpful:
-- Support for additional layout edge cases (IEEE / ACM / Springer / multi-page longtables / wrapped figures).
-- Better cross-lingual sentence alignment (e.g., Japanese / Korean / German companions or pluggable glossary hints).
-- Optional dark-mode theme and split-ratio persistence.
-- Automated layout regression tests across public LaTeX conference templates.
+Contributions, bug reports, and pull requests are very welcome! Great areas to collaborate on:
+- **Layout & template edge cases**: IEEE / ACM / Springer / multi-page `longtable` / wrapped figures / `tcolorbox` environments.
+- **Multilingual companions**: Extensible alignment hints & UI localization for Japanese, Korean, German, French, etc.
+- **SyncTeX source jump**: Clicking a PDF line to open/highlight the exact line in `.tex` inside VS Code / Cursor / Neovim.
+- **Cross-platform launcher & packaging**: macOS/Linux launcher script (`start_viewer.sh`), `pyproject.toml` / `pipx` CLI entry point, and automated layout tests.
 
-Please open an **Issue** with a minimal PDF snippet or submit a **Pull Request** directly.
+Please open an **Issue** (with a minimal PDF snippet for layout bugs) or submit a **Pull Request** directly!
 
 ## License
 
