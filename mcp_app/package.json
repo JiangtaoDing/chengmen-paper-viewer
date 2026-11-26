@@ -1,0 +1,15 @@
+{
+  "name": "chengmen-paper-viewer-mcp-app",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP App (SEP-1865) browser bridge bundle for Chengmen Paper Viewer",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/ext-apps": "^1.0.0",
+    "esbuild": "^0.25.0",
+    "zod": "^3.24.0"
+  }
+}

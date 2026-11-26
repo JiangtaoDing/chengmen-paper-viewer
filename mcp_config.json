@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "chengmen_viewer": {
+      "command": "python",
+      "args": [
+        "-B",
+        "${PLUGIN_ROOT}/mcp_server.py",
+        "--data-dir",
+        "${PLUGIN_DATA}"
+      ]
+    }
+  }
+}

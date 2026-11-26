@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import concurrent.futures
 import http.client
 import http.server
@@ -671,7 +672,7 @@ class TestCliPackagingAndFrontend(unittest.TestCase):
         self.assertTrue(has_future, "Missing `from __future__ import annotations`")
 
     def test_frontend_xss_and_js_syntax_contracts(self):
-        html = paper_viewer.HTML_PAGE
+        html = paper_viewer.render_viewer_html(mode="http", viewer_token="tok", csp_nonce="nonce123")
         # No dynamic template interpolation inside .innerHTML = `...${...}...`
         for m in re.finditer(r"\.innerHTML\s*=\s*`([^`]*)`", html):
             tpl = m.group(1)
@@ -679,7 +680,7 @@ class TestCliPackagingAndFrontend(unittest.TestCase):
             for expr in re.findall(r"\$\{([^}]+)\}", tpl):
                 self.assertIn(expr.strip(), {"cnt", "ids.length"}, f"Unsafe innerHTML interpolation: {expr!r}")
 
-        # Required frontend fix markers
+        # Required frontend fix & MCP App dual-mode markers
         for marker in (
             "X-Viewer-Token",
             "AbortController",
@@ -691,19 +692,953 @@ class TestCliPackagingAndFrontend(unittest.TestCase):
             "window.addEventListener('blur'",
             "suppressAutoFollowBriefly",
             "lockSecList.textContent = ''",
+            "__CHENGMEN_MCP_BRIDGE__",
+            "app_get_page_svg",
+            "app_get_page_png",
+            "app_get_text_layer",
+            "app_update_locks",
+            "app_select_paper",
+            "app_get_state",
+            "app_save_state",
+            "openFileInAuxPane",
+            "updateModelContext",
+            "sendMessage",
+            "openLink",
+            "URL.createObjectURL",
+            "revokeObjectURL",
+            "--color-background-primary",
+            "--color-text-primary",
+            "--color-border-primary",
+            "--font-sans",
         ):
             self.assertIn(marker, html)
 
         # If node is installed, verify extracted JS compiles cleanly with `node --check`
         node_bin = shutil.which("node")
         if node_bin:
-            m_js = re.search(r"<script[^>]*>(.*)</script>", html, re.DOTALL)
-            self.assertIsNotNone(m_js)
-            js_src = m_js.group(1).replace("__VIEWER_SESSION_TOKEN__", '"tok"')
-            js_file = self.tmp / "viewer_check.js"
-            js_file.write_text(js_src, encoding="utf-8")
-            chk = subprocess.run([node_bin, "--check", str(js_file)], capture_output=True, text=True, timeout=10)
-            self.assertEqual(chk.returncode, 0, f"JS syntax check failed:\n{chk.stderr}")
+            scripts = re.findall(r"<script[^>]*>(.*?)</script>", html, re.DOTALL)
+            self.assertGreaterEqual(len(scripts), 1)
+            for idx, js_src in enumerate(scripts):
+                js_file = self.tmp / f"viewer_check_{idx}.js"
+                js_file.write_text(js_src, encoding="utf-8")
+                chk = subprocess.run([node_bin, "--check", str(js_file)], capture_output=True, text=True, timeout=10)
+                self.assertEqual(chk.returncode, 0, f"JS syntax check failed (script {idx}):\n{chk.stderr}")
+
+
+class TestStatelessExportsAndMcpApp(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pv_mcp_"))
+        self.dir_a = self.tmp / "projA"
+        self.dir_b = self.tmp / "projB"
+        self.dir_a.mkdir()
+        self.dir_b.mkdir()
+        self.pdf_a = self.dir_a / "main.pdf"
+        self.pdf_b = self.dir_b / "main.pdf"
+        self.pdf_upper = self.dir_a / "Extra.PDF"
+        make_test_pdf(self.pdf_a)
+        make_test_pdf(self.pdf_b)
+        make_test_pdf(self.pdf_upper)
+
+        (self.dir_a / "main.tex").write_text(
+            "\\begin{document}\n\\begin{abstract}\nThis paper studies automated auditing.\n\\end{abstract}\n\\end{document}\n",
+            encoding="utf-8",
+        )
+        self.zh_a = self.dir_a / "main_zh.json"
+        self.zh_a.write_text(
+            json.dumps({
+                "file": "main.pdf",
+                "tex": "main.tex",
+                "title_zh": "论文 A 中文标题",
+                "items": [{"id": "Abstract", "page": 1, "section": "摘要", "title": "Abstract", "anchor": "Abstract", "zh": "摘要第一句。摘要第二句。"}],
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        # Ensure projB has a distinct companion JSON with same PDF filename "main.pdf"
+        self.zh_b = self.dir_b / "main_zh.json"
+        self.zh_b.write_text(
+            json.dumps({
+                "file": "main.pdf",
+                "title_zh": "论文 B 中文标题",
+                "items": [{"id": "Abstract", "page": 1, "section": "摘要", "title": "Abstract", "anchor": "Abstract", "zh": "乙论文摘要。"}],
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_list_pdfs_in_and_resolve_zh_path_for_are_stateless(self):
+        orig_dir = paper_viewer.PAPER_DIR
+        pdfs = paper_viewer.list_pdfs_in(self.dir_a)
+        self.assertEqual([p.name for p in pdfs], ["Extra.PDF", "main.pdf"])
+        self.assertEqual(paper_viewer.PAPER_DIR, orig_dir)
+
+        self.assertEqual(paper_viewer.resolve_zh_path_for(self.pdf_a), self.zh_a.resolve())
+        self.assertEqual(paper_viewer.resolve_zh_path_for(self.pdf_b), self.zh_b.resolve())
+        self.assertIsNone(paper_viewer.resolve_zh_path_for(self.pdf_upper, explicit_zh=self.zh_a))
+
+    def test_get_meta_for_and_get_zh_for_contract_and_cross_dir_cache_isolation(self):
+        meta_a = paper_viewer.get_meta_for(self.pdf_a)
+        for key in ("file", "pdf_path", "paper_dir", "pages", "sizes", "links", "files", "mtime", "tex_path", "tex_uri"):
+            self.assertIn(key, meta_a, f"Missing key {key!r} in get_meta_for")
+        self.assertEqual(meta_a["file"], "main.pdf")
+        self.assertEqual(Path(meta_a["pdf_path"]), self.pdf_a.resolve())
+        self.assertEqual(Path(meta_a["paper_dir"]), self.dir_a.resolve())
+        self.assertEqual(meta_a["pages"], meta_a["sizes"])
+        self.assertTrue(meta_a["tex_uri"].startswith("file://"))
+        self.assertIn("Extra.PDF", meta_a["files"])
+
+        meta_b = paper_viewer.get_meta_for(self.pdf_b)
+        self.assertEqual(Path(meta_b["pdf_path"]), self.pdf_b.resolve())
+        self.assertEqual(meta_b["tex_uri"], "")
+
+        zh_a = paper_viewer.get_zh_for(self.pdf_a)
+        for key in ("available", "items", "regions", "sentences", "locks", "mode", "tex", "tex_path", "tex_uri", "title_zh", "error", "note", "warnings"):
+            self.assertIn(key, zh_a, f"Missing key {key!r} in get_zh_for")
+        self.assertTrue(zh_a["available"])
+        self.assertEqual(zh_a["title_zh"], "论文 A 中文标题")
+        self.assertTrue(zh_a["tex_uri"].startswith("file://"))
+        self.assertIn("Abstract", zh_a["sentences"])
+
+        zh_b = paper_viewer.get_zh_for(self.pdf_b)
+        self.assertTrue(zh_b["available"])
+        self.assertEqual(zh_b["title_zh"], "论文 B 中文标题")
+
+        # Missing companion JSON still satisfies contract keys
+        zh_missing = paper_viewer.get_zh_for(self.pdf_upper)
+        self.assertFalse(zh_missing["available"])
+        for key in ("items", "regions", "sentences", "locks", "mode", "tex", "tex_path", "tex_uri", "title_zh", "error", "note", "warnings"):
+            self.assertIn(key, zh_missing)
+
+    def test_render_page_svg_png_and_text_layer_for(self):
+        svg = paper_viewer.render_page_svg_for(self.pdf_a, 0)
+        self.assertIsInstance(svg, str)
+        self.assertIn("<svg", svg)
+        with self.assertRaises(IndexError):
+            paper_viewer.render_page_svg_for(self.pdf_a, 99)
+
+        png_b64 = paper_viewer.render_page_png_b64_for(self.pdf_a, 0, zoom=1.5)
+        png_bytes = base64.b64decode(png_b64)
+        self.assertTrue(png_bytes.startswith(b"\x89PNG\r\n\x1a\n"))
+
+        tl_single = paper_viewer.get_text_layer_for(self.pdf_a, page_idx=0)
+        self.assertEqual(tl_single["page"], 0)
+        self.assertIn("runs", tl_single)
+        self.assertIn("mtime", tl_single)
+        self.assertNotIn("pages", tl_single)
+
+        tl_all = paper_viewer.get_text_layer_for(self.pdf_a, page_idx=None)
+        self.assertEqual(len(tl_all["pages"]), 2)
+
+        with self.assertRaises(IndexError):
+            paper_viewer.get_text_layer_for(self.pdf_a, page_idx=5)
+
+    def test_render_viewer_html_mcp_app_mode_csp_and_script_escaping(self):
+        bridge_path = ROOT_DIR / "mcp_app" / "dist" / "mcp_bridge.js"
+        self.assertTrue(bridge_path.is_file(), "Missing prebuilt mcp_app/dist/mcp_bridge.js")
+        bridge_js = bridge_path.read_text(encoding="utf-8")
+
+        html_mcp = paper_viewer.render_viewer_html(mode="mcp-app", mcp_bridge_js=bridge_js)
+        self.assertLess(len(html_mcp.encode("utf-8")), 10 * 1024 * 1024)
+        self.assertIn('window.__CHENGMEN_MODE__ = "mcp-app";', html_mcp)
+        self.assertNotIn("nonce=", html_mcp)
+        self.assertIsNone(re.search(r"<script[^>]+src=", html_mcp, re.IGNORECASE))
+        self.assertIsNone(re.search(r"<link[^>]+href=", html_mcp, re.IGNORECASE))
+        self.assertNotIn("__MCP_BRIDGE_BLOCK__", html_mcp)
+        self.assertNotIn("__SCRIPT_NONCE_ATTR__", html_mcp)
+        self.assertNotIn("__VIEWER_MODE__", html_mcp)
+        self.assertNotIn("__VIEWER_SESSION_TOKEN__", html_mcp)
+
+        # Ensure closing </script> inside bridge JS is safely escaped
+        escaped_html = paper_viewer.render_viewer_html(mode="mcp-app", mcp_bridge_js='const s = "</script><SCRIPT>";')
+        self.assertIn(r"<\/script>", escaped_html)
+        self.assertIn('const s = "<\\/script><SCRIPT>";', escaped_html)
+
+        with self.assertRaises(ValueError):
+            paper_viewer.render_viewer_html(mode="invalid")
+
+        node_bin = shutil.which("node")
+        if node_bin:
+            scripts = re.findall(r"<script[^>]*>(.*?)</script>", html_mcp, re.DOTALL)
+            self.assertEqual(len(scripts), 3)
+            for idx, js_src in enumerate(scripts):
+                js_file = self.tmp / f"mcp_html_script_{idx}.js"
+                js_file.write_text(js_src, encoding="utf-8")
+                chk = subprocess.run([node_bin, "--check", str(js_file)], capture_output=True, text=True, timeout=10)
+                self.assertEqual(chk.returncode, 0, f"MCP App HTML script {idx} failed node --check:\n{chk.stderr}")
+
+    def test_mcp_bridge_bundle_sep1865_handshake_and_concurrency_cap(self):
+        node_bin = shutil.which("node")
+        if not node_bin:
+            self.skipTest("node is not installed")
+
+        bridge_path = ROOT_DIR / "mcp_app" / "dist" / "mcp_bridge.js"
+        harness = self.tmp / "bridge_harness.mjs"
+        harness.write_text(
+            f"""
+import fs from 'node:fs';
+import vm from 'node:vm';
+
+const listeners = [];
+const sent = [];
+let inFlightTools = 0;
+let maxObservedInFlight = 0;
+const toolCallOrder = [];
+const toolCallArgs = {{}};
+const pendingResolvers = [];
+
+const styleProps = new Map();
+const rootAttrs = new Map();
+const docEl = {{
+  style: {{
+    setProperty: (k, v) => styleProps.set(k, v),
+    colorScheme: '',
+    height: '',
+  }},
+  setAttribute: (k, v) => rootAttrs.set(k, v),
+  getAttribute: (k) => rootAttrs.get(k) || null,
+  getBoundingClientRect: () => ({{ width: 900, height: 640 }}),
+  classList: {{ toggle: () => {{}} }},
+}};
+const document = {{
+  documentElement: docEl,
+  head: {{ appendChild: () => {{}} }},
+  body: {{ classList: {{ add: () => {{}}, toggle: () => {{}} }} }},
+  createElement: () => ({{ style: {{}}, setAttribute: () => {{}}, textContent: '' }}),
+  getElementById: () => null,
+}};
+
+const windowObj = {{
+  __CHENGMEN_MODE__: 'mcp-app',
+  innerWidth: 900,
+  innerHeight: 640,
+  document,
+  addEventListener: (ev, fn) => {{ if (ev === 'message') listeners.push(fn); }},
+  removeEventListener: (ev, fn) => {{
+    const i = listeners.indexOf(fn);
+    if (i !== -1) listeners.splice(i, 1);
+  }},
+  parent: null,
+}};
+
+function dispatchFromHost(msg) {{
+  for (const fn of [...listeners]) {{
+    fn({{ data: msg, source: windowObj.parent, origin: 'null' }});
+  }}
+}}
+
+windowObj.parent = {{
+  postMessage: (msg) => {{
+    sent.push(msg);
+    if (msg.method === 'ui/initialize') {{
+      queueMicrotask(() => {{
+        dispatchFromHost({{
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {{
+            protocolVersion: msg.params.protocolVersion,
+            hostInfo: {{ name: 'MockAntigravity', version: '1.0' }},
+            hostCapabilities: {{
+              serverTools: {{ listChanged: false }},
+              message: {{ text: {{}} }},
+              updateModelContext: {{ text: {{}} }},
+              openLinks: {{}},
+            }},
+            hostContext: {{
+              theme: 'light',
+              styles: {{ variables: {{ '--color-background-primary': '#fafafa' }} }},
+            }},
+          }},
+        }});
+      }});
+    }} else if (msg.method === 'ui/notifications/initialized') {{
+      queueMicrotask(() => {{
+        dispatchFromHost({{
+          jsonrpc: '2.0',
+          method: 'ui/notifications/tool-result',
+          params: {{
+            content: [{{ type: 'text', text: 'opened' }}],
+            structuredContent: {{ has_paper: true, file: 'demo.pdf' }},
+          }},
+        }});
+      }});
+    }} else if (msg.method === 'tools/call') {{
+      inFlightTools += 1;
+      maxObservedInFlight = Math.max(maxObservedInFlight, inFlightTools);
+      toolCallOrder.push(msg.params.name);
+      toolCallArgs[msg.params.name] = msg.params.arguments;
+      pendingResolvers.push(() => {{
+        inFlightTools -= 1;
+        dispatchFromHost({{
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {{
+            content: [{{ type: 'text', text: 'ok' }}],
+            structuredContent: {{ called: msg.params.name }},
+          }},
+        }});
+      }});
+    }} else if (msg.method === 'com.google.antigravity/toggle-aux-pane') {{
+      queueMicrotask(() => {{
+        dispatchFromHost({{
+          jsonrpc: '2.0',
+          id: msg.id,
+          error: {{ code: -32601, message: 'Method not found' }},
+        }});
+      }});
+    }}
+  }},
+}};
+
+const ctx = vm.createContext({{
+  window: windowObj,
+  self: windowObj,
+  globalThis: windowObj,
+  document,
+  console,
+  setTimeout,
+  clearTimeout,
+  queueMicrotask,
+  URL,
+  Blob,
+  DOMException,
+  AbortController,
+  ResizeObserver: class {{ observe() {{}} disconnect() {{}} }},
+  requestAnimationFrame: (cb) => setTimeout(cb, 0),
+}});
+windowObj.window = windowObj;
+
+const src = fs.readFileSync({json.dumps(str(bridge_path))}, 'utf8');
+vm.runInContext(src, ctx);
+
+const bridge = windowObj.__CHENGMEN_MCP_BRIDGE__;
+if (!bridge) throw new Error('Bridge not mounted on window.__CHENGMEN_MCP_BRIDGE__');
+
+await bridge.ready;
+const caps = bridge.getCapabilities();
+if (!caps.serverTools || !caps.message || !caps.updateModelContext || !caps.openLinks) {{
+  throw new Error('Unexpected capabilities: ' + JSON.stringify(caps));
+}}
+if (rootAttrs.get('data-theme') !== 'light') {{
+  throw new Error('Theme not applied: ' + rootAttrs.get('data-theme'));
+}}
+if (styleProps.get('--color-background-primary') !== '#fafafa') {{
+  throw new Error('Host style variable not applied');
+}}
+
+// Replay buffered initial tool-result
+let replayed = null;
+bridge.onToolResult((r) => {{ replayed = r; }});
+await new Promise((r) => setTimeout(r, 20));
+if (!replayed || replayed.structuredContent?.file !== 'demo.pdf') {{
+  throw new Error('Initial tool-result not received/replayed');
+}}
+
+// Fire 6 concurrent calls with priorities; cap must remain <= 3 and priority 10 must preempt queued priority 0
+// Also verify undefined keys (top-level & nested) are stripped before tools/call transmission
+const calls = [
+  bridge.callTool('low_1', {{ keep: 'ok', drop: undefined }}, 0),
+  bridge.callTool('low_2', {{ nested: {{ a: 1, b: undefined }} }}, 0),
+  bridge.callTool('low_3', {{}}, 0),
+  bridge.callTool('low_4', {{}}, 0),
+  bridge.callTool('high_urgent', {{ pdf_path: '/a.pdf', zh_path: undefined }}, 10),
+  bridge.callTool('low_5', {{}}, 0),
+];
+await new Promise((r) => setTimeout(r, 20));
+if (maxObservedInFlight > 3) {{
+  throw new Error('Concurrency cap exceeded: ' + maxObservedInFlight);
+}}
+while (pendingResolvers.length > 0) {{
+  const fn = pendingResolvers.shift();
+  fn();
+  await new Promise((r) => setTimeout(r, 5));
+}}
+const results = await Promise.all(calls);
+if (results[4]?.called !== 'high_urgent') throw new Error('Unwrap failed');
+if (toolCallOrder[3] !== 'high_urgent') {{
+  throw new Error('Priority scheduling failed: ' + JSON.stringify(toolCallOrder));
+}}
+if ('drop' in (toolCallArgs.low_1 || {{}}) || toolCallArgs.low_1?.keep !== 'ok') {{
+  throw new Error('Top-level undefined key not stripped: ' + JSON.stringify(toolCallArgs.low_1));
+}}
+if ('b' in (toolCallArgs.low_2?.nested || {{}}) || toolCallArgs.low_2?.nested?.a !== 1) {{
+  throw new Error('Nested undefined key not stripped: ' + JSON.stringify(toolCallArgs.low_2));
+}}
+if ('zh_path' in (toolCallArgs.high_urgent || {{}}) || toolCallArgs.high_urgent?.pdf_path !== '/a.pdf') {{
+  throw new Error('zh_path undefined key leaked: ' + JSON.stringify(toolCallArgs.high_urgent));
+}}
+
+// Unsupported toggle-aux-pane (-32601) returns graceful unsupported object instead of throwing
+const auxRes = await bridge.openFileInAuxPane('file:///tmp/demo.tex');
+if (auxRes.ok !== false || auxRes.unsupported !== true) {{
+  throw new Error('Unexpected toggle-aux-pane fallback: ' + JSON.stringify(auxRes));
+}}
+
+console.log('MCP_BRIDGE_HARNESS_OK', JSON.stringify({{ maxObservedInFlight, toolCallOrder }}));
+""",
+            encoding="utf-8",
+        )
+        res = subprocess.run([node_bin, str(harness)], capture_output=True, text=True, timeout=20)
+        self.assertEqual(res.returncode, 0, f"Bridge harness failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}")
+        self.assertIn("MCP_BRIDGE_HARNESS_OK", res.stdout)
+
+    def test_mcp_app_frontend_same_pdf_jump_startup_race_and_no_fetch(self):
+        node_bin = shutil.which("node")
+        if not node_bin:
+            self.skipTest("node is not installed")
+
+        bridge_path = ROOT_DIR / "mcp_app" / "dist" / "mcp_bridge.js"
+        bridge_js = bridge_path.read_text(encoding="utf-8")
+        html_mcp = paper_viewer.render_viewer_html(mode="mcp-app", mcp_bridge_js=bridge_js)
+        scripts = re.findall(r"<script[^>]*>(.*?)</script>", html_mcp, re.DOTALL)
+        self.assertEqual(len(scripts), 3)
+
+        html_no_bridge = paper_viewer.render_viewer_html(mode="mcp-app", mcp_bridge_js="")
+        scripts_no_bridge = re.findall(r"<script[^>]*>(.*?)</script>", html_no_bridge, re.DOTALL)
+        self.assertEqual(len(scripts_no_bridge), 3)
+        self.assertEqual(scripts_no_bridge[1].strip(), "")
+
+        script_bundle_path = self.tmp / "mcp_scripts.json"
+        script_bundle_path.write_text(
+            json.dumps({"full": scripts, "no_bridge": scripts_no_bridge}),
+            encoding="utf-8",
+        )
+
+        harness = self.tmp / "frontend_mcp_harness.mjs"
+        harness.write_text(
+            f"""
+import fs from 'node:fs';
+import vm from 'node:vm';
+
+const bundles = JSON.parse(fs.readFileSync({json.dumps(str(script_bundle_path))}, 'utf8'));
+
+function createMockEnv(opts = {{}}) {{
+  const idMap = new Map();
+  const winListeners = new Map();
+  const docListeners = new Map();
+  const ioInstances = [];
+  let fetchCalls = 0;
+
+  class ClassList {{
+    constructor(el) {{ this.el = el; this.set = new Set(); }}
+    add(...cls) {{ cls.forEach(c => c && this.set.add(c)); }}
+    remove(...cls) {{ cls.forEach(c => this.set.delete(c)); }}
+    toggle(c, force) {{
+      if (force === undefined) {{
+        if (this.set.has(c)) {{ this.set.delete(c); return false; }}
+        this.set.add(c); return true;
+      }}
+      if (force) this.set.add(c); else this.set.delete(c);
+      return Boolean(force);
+    }}
+    contains(c) {{ return this.set.has(c); }}
+  }}
+
+  class El {{
+    constructor(tag = 'div', id = '') {{
+      this.tagName = String(tag).toUpperCase();
+      this.id = id;
+      this.dataset = {{}};
+      this.children = [];
+      this.parentNode = null;
+      this.classList = new ClassList(this);
+      this.style = {{
+        _props: new Map(),
+        setProperty(k, v) {{ this._props.set(k, v); }},
+        colorScheme: '',
+        height: '',
+        display: '',
+        width: '',
+        flex: '',
+        left: '',
+        top: '',
+        userSelect: '',
+      }};
+      this._text = '';
+      this._className = '';
+      this.value = '';
+      this.title = '';
+      this.src = '';
+      this.scrollTop = 0;
+      this.scrollLeft = 0;
+      this.scrollHeight = 2000;
+      this.scrollWidth = 800;
+      this.clientHeight = 700;
+      this.clientWidth = 800;
+      this.offsetWidth = 100;
+      this._listeners = new Map();
+    }}
+    get className() {{ return this._className; }}
+    set className(v) {{
+      this._className = String(v || '');
+      this.classList.set = new Set(this._className.split(/\\s+/).filter(Boolean));
+    }}
+    get textContent() {{ return this._text; }}
+    set textContent(v) {{
+      this._text = String(v ?? '');
+      if (this._text === '') this.children = [];
+    }}
+    get innerHTML() {{ return this._innerHTML || ''; }}
+    set innerHTML(v) {{
+      this._innerHTML = String(v ?? '');
+      this.children = [];
+      const re = /<([a-z0-9]+)[^>]*class="([^"]+)"[^>]*>/gi;
+      let m;
+      while ((m = re.exec(this._innerHTML)) !== null) {{
+        const child = new El(m[1]);
+        child.className = m[2];
+        this.appendChild(child);
+      }}
+    }}
+    appendChild(child) {{
+      if (!child) return child;
+      if (child.tagName === '#FRAGMENT') {{
+        for (const c of child.children) this.appendChild(c);
+        child.children = [];
+        return child;
+      }}
+      child.parentNode = this;
+      this.children.push(child);
+      return child;
+    }}
+    remove() {{
+      if (!this.parentNode) return;
+      const i = this.parentNode.children.indexOf(this);
+      if (i !== -1) this.parentNode.children.splice(i, 1);
+      this.parentNode = null;
+    }}
+    setAttribute(k, v) {{ this['_attr_' + k] = v; }}
+    getAttribute(k) {{ return this['_attr_' + k] ?? null; }}
+    addEventListener(ev, fn) {{
+      if (!this._listeners.has(ev)) this._listeners.set(ev, []);
+      this._listeners.get(ev).push(fn);
+    }}
+    removeEventListener(ev, fn) {{
+      const arr = this._listeners.get(ev) || [];
+      const i = arr.indexOf(fn);
+      if (i !== -1) arr.splice(i, 1);
+    }}
+    getBoundingClientRect() {{ return {{ top: 0, left: 0, right: 800, bottom: 700, width: 800, height: 700 }}; }}
+    getContext() {{ return {{ font: '', measureText: (s) => ({{ width: String(s || '').length * 7 }}) }}; }}
+    focus() {{}}
+    blur() {{}}
+    select() {{}}
+    removeAttribute(k) {{ delete this['_attr_' + k]; }}
+    closest(sel) {{
+      let cur = this;
+      while (cur) {{
+        if (cur._matches && cur._matches(sel)) return cur;
+        cur = cur.parentNode;
+      }}
+      return null;
+    }}
+    scrollIntoView() {{}}
+    scrollTo() {{}}
+    contains(node) {{
+      if (node === this) return true;
+      for (const c of this.children) if (c.contains && c.contains(node)) return true;
+      return false;
+    }}
+    _matches(sel) {{
+      const pageAttr = sel.match(/^\\.page-card\\[data-page="([^"]+)"\\]$/);
+      if (pageAttr) return this.classList.contains('page-card') && String(this.dataset.page) === pageAttr[1];
+      const idAttr = sel.match(/^\\.zh-card\\[data-id="([^"]+)"\\]$/);
+      if (idAttr) return this.classList.contains('zh-card') && String(this.dataset.id) === idAttr[1];
+      if (sel.includes(' ')) {{
+        const parts = sel.trim().split(/\\s+/);
+        return this._matches(parts[parts.length - 1]);
+      }}
+      if (sel.startsWith('.')) return this.classList.contains(sel.slice(1));
+      return this.tagName === sel.toUpperCase();
+    }}
+    querySelectorAll(sel) {{
+      const out = [];
+      const walk = (n) => {{
+        for (const c of n.children || []) {{
+          if (c._matches && c._matches(sel)) out.push(c);
+          walk(c);
+        }}
+      }};
+      walk(this);
+      return out;
+    }}
+    querySelector(sel) {{ return this.querySelectorAll(sel)[0] || null; }}
+  }}
+
+  const ensureId = (id) => {{
+    if (!idMap.has(id)) idMap.set(id, new El('div', id));
+    return idMap.get(id);
+  }};
+  const viewerEl = ensureId('viewer');
+  const viewerInnerEl = ensureId('viewerInner');
+  viewerEl.appendChild(viewerInnerEl);
+  const zhPaneEl = ensureId('zhPane');
+  const zhTitleEl = new El('div');
+  zhTitleEl.className = 'zh-title';
+  zhPaneEl.appendChild(zhTitleEl);
+
+  const docEl = new El('html');
+  const bodyEl = new El('body');
+  const document = {{
+    documentElement: docEl,
+    head: new El('head'),
+    body: bodyEl,
+    hidden: false,
+    title: '',
+    activeElement: null,
+    getElementById: (id) => ensureId(id),
+    createElement: (tag) => new El(tag),
+    createDocumentFragment: () => new El('#FRAGMENT'),
+    createTextNode: (t) => ({{ nodeType: 3, textContent: String(t) }}),
+    querySelectorAll: () => [],
+    querySelector: () => null,
+    addEventListener: (ev, fn) => {{
+      if (!docListeners.has(ev)) docListeners.set(ev, []);
+      docListeners.get(ev).push(fn);
+    }},
+  }};
+
+  const windowObj = {{
+    innerWidth: 1200,
+    innerHeight: 800,
+    document,
+    location: {{ search: '' }},
+    localStorage: {{
+      getItem: () => {{ throw new Error('SecurityError'); }},
+      setItem: () => {{ throw new Error('SecurityError'); }},
+    }},
+    getSelection: () => ({{ isCollapsed: true, rangeCount: 0, toString: () => '' }}),
+    addEventListener: (ev, fn) => {{
+      if (!winListeners.has(ev)) winListeners.set(ev, []);
+      winListeners.get(ev).push(fn);
+    }},
+    removeEventListener: (ev, fn) => {{
+      const arr = winListeners.get(ev) || [];
+      const i = arr.indexOf(fn);
+      if (i !== -1) arr.splice(i, 1);
+    }},
+    parent: null,
+  }};
+
+  const dispatchFromHost = (msg) => {{
+    for (const fn of [...(winListeners.get('message') || [])]) {{
+      fn({{ data: msg, source: windowObj.parent, origin: 'null' }});
+    }}
+  }};
+
+  windowObj.parent = {{
+    postMessage: (msg) => {{
+      if (opts.onPostMessage) opts.onPostMessage(msg, dispatchFromHost);
+    }},
+  }};
+
+  class MockIntersectionObserver {{
+    constructor(cb) {{
+      this.cb = cb;
+      this.observed = [];
+      this.disconnected = false;
+      ioInstances.push(this);
+    }}
+    observe(el) {{ this.observed.push(el); }}
+    disconnect() {{ this.disconnected = true; }}
+    trigger(el) {{
+      if (this.disconnected) return;
+      this.cb([{{ isIntersecting: true, target: el }}]);
+    }}
+  }}
+
+  const timers = new Set();
+  const safeSetTimeout = (fn, ms) => {{
+    const id = setTimeout(() => {{ timers.delete(id); fn(); }}, ms);
+    timers.add(id);
+    return id;
+  }};
+  const safeClearTimeout = (id) => {{ timers.delete(id); clearTimeout(id); }};
+  const cleanup = () => {{ for (const id of timers) clearTimeout(id); timers.clear(); }};
+
+  const blobCounter = {{ n: 0 }};
+  const MockURL = {{
+    createObjectURL: () => `blob:mock-${{++blobCounter.n}}`,
+    revokeObjectURL: () => {{}},
+  }};
+
+  const ctx = vm.createContext({{
+    window: windowObj,
+    self: windowObj,
+    globalThis: windowObj,
+    document,
+    location: windowObj.location,
+    navigator: {{}},
+    CSS: {{ escape: (s) => String(s) }},
+    console,
+    setTimeout: safeSetTimeout,
+    clearTimeout: safeClearTimeout,
+    queueMicrotask,
+    URL: MockURL,
+    URLSearchParams,
+    Blob,
+    DOMException,
+    AbortController,
+    IntersectionObserver: MockIntersectionObserver,
+    ResizeObserver: class {{ observe() {{}} disconnect() {{}} }},
+    requestAnimationFrame: (cb) => safeSetTimeout(cb, 0),
+    fetch: async () => {{
+      fetchCalls += 1;
+      throw new Error('CSP_FETCH_BLOCKED');
+    }},
+  }});
+  windowObj.window = windowObj;
+
+  return {{
+    ctx,
+    idMap,
+    ioInstances,
+    dispatchFromHost,
+    cleanup,
+    getFetchCalls: () => fetchCalls,
+  }};
+}}
+
+// --- Scenario A: delayed open_paper tool-input/result + same-PDF jump to page 4 + observer scroll to page 3 ---
+{{
+  const toolCalls = [];
+  const metaPayload = {{
+    file: 'paper.pdf',
+    pdf_path: '/proj/paper.pdf',
+    paper_dir: '/proj',
+    mtime: 1000,
+    mtime_str: '12:00:00',
+    page_count: 4,
+    pages: [{{ w: 612, h: 792 }}, {{ w: 612, h: 792 }}, {{ w: 612, h: 792 }}, {{ w: 612, h: 792 }}],
+    sizes: [{{ w: 612, h: 792 }}, {{ w: 612, h: 792 }}, {{ w: 612, h: 792 }}, {{ w: 612, h: 792 }}],
+    links: [[], [], [], []],
+    files: ['paper.pdf'],
+    tex_path: '',
+    tex_uri: '',
+  }};
+  const zhPayload = {{
+    available: true,
+    file: 'paper.pdf',
+    mtime: 1000,
+    mtime_str: '12:00:00',
+    pdf_mtime: 1000,
+    locks_mtime: 0,
+    title_zh: '测试论文',
+    items: [
+      {{ id: 'Sec1', page: 1, section: '§1', title: 'Intro', zh: '引言。', en_preview: 'Intro' }},
+      {{ id: 'Sec3', page: 4, section: '§3', title: 'Method', zh: '方法。', en_preview: 'Method' }},
+    ],
+    regions: [
+      {{ id: 'Sec3', page: 4, rect: [0.1, 0.2, 0.9, 0.4] }},
+    ],
+    sentences: {{}},
+    locked_ids: [],
+    lock_mode: 'deny',
+  }};
+
+  const env = createMockEnv({{
+    onPostMessage: (msg, reply) => {{
+      if (msg.method === 'ui/initialize') {{
+        queueMicrotask(() => reply({{
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {{
+            protocolVersion: msg.params.protocolVersion,
+            hostInfo: {{ name: 'MockHost', version: '1.0' }},
+            hostCapabilities: {{ serverTools: {{}}, message: {{ text: {{}} }}, updateModelContext: {{ text: {{}} }} }},
+            hostContext: {{ theme: 'dark' }},
+          }},
+        }}));
+      }} else if (msg.method === 'ui/notifications/initialized') {{
+        // Simulate host sending tool-input at 30ms and tool-result at 60ms (after ui/initialize)
+        setTimeout(() => reply({{
+          jsonrpc: '2.0',
+          method: 'ui/notifications/tool-input',
+          params: {{ arguments: {{ pdf_path: '/proj/paper.pdf' }} }},
+        }}), 30);
+        setTimeout(() => reply({{
+          jsonrpc: '2.0',
+          method: 'ui/notifications/tool-result',
+          params: {{
+            content: [{{ type: 'text', text: 'opened' }}],
+            structuredContent: {{
+              has_paper: true,
+              file: 'paper.pdf',
+              pdf_path: '/proj/paper.pdf',
+              paper_dir: '/proj',
+              zh_path: '/proj/paper_zh.json',
+              meta: metaPayload,
+              zh: zhPayload,
+            }},
+          }},
+        }}), 60);
+      }} else if (msg.method === 'tools/call') {{
+        toolCalls.push({{ name: msg.params.name, args: msg.params.arguments }});
+        let sc = {{ ok: true }};
+        if (msg.params.name === 'app_get_page_svg') {{
+          sc = {{ page_idx: msg.params.arguments.page_idx, svg: '<svg xmlns="http://www.w3.org/2000/svg"></svg>' }};
+        }} else if (msg.params.name === 'app_get_text_layer') {{
+          sc = {{ page: msg.params.arguments.page_idx, w: 612, h: 792, runs: [] }};
+        }}
+        queueMicrotask(() => reply({{
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {{ content: [{{ type: 'text', text: 'ok' }}], structuredContent: sc }},
+        }}));
+      }}
+    }},
+  }});
+
+  try {{
+    for (const s of bundles.full) vm.runInContext(s, env.ctx);
+    await new Promise(r => setTimeout(r, 450));
+
+    if (toolCalls.some(c => c.name === 'app_get_state')) {{
+      throw new Error('Startup race: app_get_state called despite delayed open_paper tool-input/result');
+    }}
+    const initialSvgPages = toolCalls.filter(c => c.name === 'app_get_page_svg').map(c => c.args.page_idx);
+    if (!initialSvgPages.includes(0) || !initialSvgPages.includes(1)) {{
+      throw new Error('Initial pages 0..1 did not eagerly load: ' + JSON.stringify(initialSvgPages));
+    }}
+    if (initialSvgPages.includes(2) || initialSvgPages.includes(3)) {{
+      throw new Error('Pages 2..3 should still be unloaded before jump/scroll: ' + JSON.stringify(initialSvgPages));
+    }}
+
+    // Second open_paper on the SAME PDF with jump_id='Sec3', page=4
+    env.dispatchFromHost({{
+      jsonrpc: '2.0',
+      method: 'ui/notifications/tool-result',
+      params: {{
+        content: [{{ type: 'text', text: 'jumped' }}],
+        structuredContent: {{
+          has_paper: true,
+          file: 'paper.pdf',
+          pdf_path: '/proj/paper.pdf',
+          paper_dir: '/proj',
+          zh_path: '/proj/paper_zh.json',
+          jump_id: 'Sec3',
+          page: 4,
+          meta: metaPayload,
+          zh: zhPayload,
+        }},
+      }},
+    }});
+    await new Promise(r => setTimeout(r, 60));
+
+    const card4 = env.idMap.get('viewer').querySelector('.page-card[data-page="4"]');
+    if (!card4 || card4.dataset.mcpLoaded !== '1') {{
+      throw new Error('Same-PDF jump to page 4 failed to load page 4 assets');
+    }}
+
+    // Now simulate scrolling to page 3 via the existing IntersectionObserver (must NOT be killed by epoch/abort!)
+    const card3 = env.idMap.get('viewer').querySelector('.page-card[data-page="3"]');
+    const activeIo = env.ioInstances[env.ioInstances.length - 1];
+    if (!activeIo || activeIo.disconnected) {{
+      throw new Error('IntersectionObserver missing or unexpectedly disconnected');
+    }}
+    activeIo.trigger(card3);
+    await new Promise(r => setTimeout(r, 60));
+
+    if (!card3 || card3.dataset.mcpLoaded !== '1') {{
+      throw new Error('Same-PDF observer scroll to page 3 left page 3 blank (epoch/signal invalidated)');
+    }}
+    if (env.getFetchCalls() !== 0) {{
+      throw new Error('Unexpected fetch() call in MCP App mode: ' + env.getFetchCalls());
+    }}
+  }} finally {{
+    env.cleanup();
+  }}
+}}
+
+// --- Scenario B: standalone startup with deleted last_pdf falls back silently without error toast ---
+{{
+  const toolCalls = [];
+  const env = createMockEnv({{
+    onPostMessage: (msg, reply) => {{
+      if (msg.method === 'ui/initialize') {{
+        queueMicrotask(() => reply({{
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {{
+            protocolVersion: msg.params.protocolVersion,
+            hostInfo: {{ name: 'MockHost', version: '1.0' }},
+            hostCapabilities: {{ serverTools: {{}} }},
+            hostContext: {{ theme: 'dark' }},
+          }},
+        }}));
+      }} else if (msg.method === 'tools/call') {{
+        toolCalls.push(msg.params.name);
+        if (msg.params.name === 'app_get_state') {{
+          queueMicrotask(() => reply({{
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: {{
+              content: [{{ type: 'text', text: 'state' }}],
+              structuredContent: {{ last_pdf: '/deleted/missing.pdf', recent_papers: [] }},
+            }},
+          }}));
+        }} else if (msg.params.name === 'app_select_paper') {{
+          queueMicrotask(() => reply({{
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: {{
+              isError: true,
+              content: [{{ type: 'text', text: 'PDF not found: /deleted/missing.pdf' }}],
+            }},
+          }}));
+        }}
+      }}
+    }},
+  }});
+
+  try {{
+    for (const s of bundles.full) vm.runInContext(s, env.ctx);
+    await new Promise(r => setTimeout(r, 460));
+
+    if (!toolCalls.includes('app_get_state') || !toolCalls.includes('app_select_paper')) {{
+      throw new Error('Expected delayed fallback recovery calls, got: ' + JSON.stringify(toolCalls));
+    }}
+    const guideEl = env.idMap.get('emptyGuide');
+    if (!guideEl.classList.contains('open')) {{
+      throw new Error('Expected emptyGuide to open after deleted last_pdf recovery failed');
+    }}
+    const toastTxt = env.idMap.get('toast').textContent || '';
+    if (toastTxt.includes('打开论文失败')) {{
+      throw new Error('Startup recovery popped error toast for deleted last_pdf: ' + toastTxt);
+    }}
+    if (env.getFetchCalls() !== 0) {{
+      throw new Error('Unexpected fetch() call during startup recovery: ' + env.getFetchCalls());
+    }}
+  }} finally {{
+    env.cleanup();
+  }}
+}}
+
+// --- Scenario C: mcp-app mode without MCP_BRIDGE must NEVER fall back to fetch('/api/...') ---
+{{
+  const env = createMockEnv();
+  try {{
+    for (const s of bundles.no_bridge) vm.runInContext(s, env.ctx);
+    await new Promise(r => setTimeout(r, 50));
+    if (env.getFetchCalls() !== 0) {{
+      throw new Error('mcp-app mode fell back to fetch() without bridge: ' + env.getFetchCalls());
+    }}
+    const guideEl = env.idMap.get('emptyGuide');
+    if (!guideEl.classList.contains('open')) {{
+      throw new Error('Expected emptyGuide to open when MCP_BRIDGE is missing');
+    }}
+  }} finally {{
+    env.cleanup();
+  }}
+}}
+
+console.log('FRONTEND_MCP_HARNESS_OK');
+""",
+            encoding="utf-8",
+        )
+        res = subprocess.run([node_bin, str(harness)], capture_output=True, text=True, timeout=25)
+        self.assertEqual(res.returncode, 0, f"Frontend MCP harness failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}")
+        self.assertIn("FRONTEND_MCP_HARNESS_OK", res.stdout)
 
 
 if __name__ == "__main__":

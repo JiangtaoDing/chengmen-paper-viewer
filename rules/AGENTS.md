@@ -1,0 +1,6 @@
+# Chengmen Paper Viewer Workspace Rules
+
+1. **Prefer the native MCP App side pane**: When the user asks to preview, read, proofread, or review a LaTeX paper PDF with Chinese companions, call `open_paper` on the `chengmen_viewer` MCP server so the vector-SVG viewer opens directly inside Antigravity's side pane instead of spawning an external local HTTP server (unless the user explicitly asks for standalone HTTP mode).
+2. **Maintain an atomic Edit–Compile–Sync loop**: Whenever you edit a `.tex` manuscript and recompile its `.pdf`, update the corresponding items (`zh`, `lines`, `en_preview`, `anchor`, `sent_align`, `is_todo`) in `<pdf_stem>_zh.json` in the same step, and run `sync_paper_companion` when anchors or section structure change substantially.
+3. **Strictly respect paragraph/section locks**: Before modifying `.tex`, check lock status via `list_paper_locks` if locks may exist. Never modify locked `.tex` spans or directly edit `*.locks.json` files; if a locked paragraph requires revision, ask the user to unlock it in the Chengmen Paper Viewer UI first.
+4. **Keep the LaTeX submission directory clean**: Store companion JSON (`*_zh.json`) and lock files (`*.locks.json`) inside an ignored `.paper_viewer/` directory (automatically preferred whenever `.paper_viewer/` exists) or outside the submission root via `zh_path`.
