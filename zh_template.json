@@ -1,6 +1,6 @@
 {
   "file": "main.pdf",
-  "tex": "path/to/paper/main.tex",
+  "tex": "main.tex",
   "title_zh": "在这里填论文中文标题",
   "items": [
     {
@@ -34,6 +34,7 @@
       "anchor": "1. Introduction",
       "en_preview": "Opening sentence of Introduction...",
       "zh": "引言第一段中文对照。",
+      "sent_align": [[0]],
       "is_todo": false
     },
     {

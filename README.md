@@ -21,11 +21,12 @@ Render your compiled English `.pdf` on the left as **lossless vector SVG** (with
    - **Whole-paragraph & float regions**: Clicking a card header or any figure/table highlights the full block (including cross-column / cross-page continuations, stacked floats, and `\onecolumn` appendices).
 4. **Paragraph & Section Hard-Lock Guard for AI Co-Writing (`paper_lock.py`)**
    - Lock any finalized paragraph, figure, table, or entire section with one click in the UI (`🔓 锁定` / `🔒 锁定管理`).
-   - Pair with an AI agent `PreToolUse` hook (`python path/to/paper_lock.py --hook`) supporting **`Hard Lock (deny)`** or **`Ask Approval (force_ask)`** modes so AI assistants never accidentally overwrite locked LaTeX spans or tamper with `.locks.json`.
+   - Pair with an AI agent `PreToolUse` hook (`python path/to/paper_lock.py --hook`) supporting both **Antigravity** and **Claude Code** hook protocols, with **`Hard Lock (deny)`** or **`Ask Approval (force_ask / ask)`** modes so AI assistants never accidentally overwrite locked LaTeX spans or tamper with `.locks.json`.
+   - Supports storing lock files inside an ignored `.paper_viewer/<stem>.locks.json` directory (automatically used when `.paper_viewer/` exists, while remaining backward-compatible with `<stem>.locks.json`).
    - Optional subtle left-edge lock bars on the PDF (`PDF锁标`, off by default to keep typography inspection pure).
 5. **Automatic Hot Reload (~1.5 s) & Zero LaTeX Pollution**
    - Whenever `pdflatex` / `xelatex` updates `.pdf` or you/your AI assistant edits `*_zh.json`, both panes hot-reload automatically while preserving scroll position and dynamically recomputing page numbers, bounding boxes, and hyperlinks.
-   - Keep `*_zh.json` outside your submission folder via `--zh` (or inside an ignored `.paper_viewer/` directory).
+   - Keep `*_zh.json` outside your submission folder via `--zh` (or inside an ignored `.paper_viewer/` or `companions/` directory).
 
 ---
 
@@ -34,11 +35,11 @@ Render your compiled English `.pdf` on the left as **lossless vector SVG** (with
 | Path | Description |
 |---|---|
 | `paper_viewer.py` | Standalone local HTTP server (single-file Python + PyMuPDF, zero Node/npm build step) |
-| `paper_lock.py` | Paragraph/section lock engine + `PreToolUse` hook guard for AI coding agents |
-| `start_viewer.ps1` | Windows PowerShell launcher wrapper |
+| `paper_lock.py` | Paragraph/section lock engine + `PreToolUse` hook guard (Antigravity & Claude Code) |
+| `start_viewer.ps1` | Windows PowerShell launcher with pre-flight path/port/Python checks |
 | `zh_template.json` | Starter schema for a new paper's bilingual companion JSON |
 | `skill/bilingual-paper-workflow/SKILL.md` | Drop-in agent skill prompt for AI-assisted Edit–Compile–Sync paper writing |
-| `requirements.txt` | Python dependencies (`pymupdf`) |
+| `requirements.txt` | Python dependencies (`pymupdf>=1.24.0,<2.0`) |
 
 ---
 
@@ -49,24 +50,34 @@ Render your compiled English `.pdf` on the left as **lossless vector SVG** (with
 git clone https://github.com/JiangtaoDing/chengmen-paper-viewer.git
 cd chengmen-paper-viewer
 pip install -r requirements.txt
-# or simply: pip install pymupdf
+# or simply: pip install "pymupdf>=1.24.0,<2.0"
 ```
 
 ### 2. Run the Live Viewer
 ```bash
-# Auto-discovers <pdf_dir>/.paper_viewer/<stem>_zh.json or <stem>_zh.json
+# Auto-discovers companion JSON in order:
+#   1. <pdf_dir>/.paper_viewer/<stem>_zh.json
+#   2. <pdf_dir>/<stem>_zh.json
+#   3. <repo_dir>/companions/<stem>_zh.json
 python paper_viewer.py --pdf path/to/paper/main.pdf --port 8788
 
-# Or specify the companion JSON path explicitly (use different ports for multiple papers)
+# Specify the companion JSON path explicitly (use different ports for multiple papers)
 python paper_viewer.py \
   --pdf path/to/paper/main.pdf \
   --zh path/to/main_zh.json \
   --port 8788
+
+# Or serve a whole directory of PDFs with an optional default selection
+python paper_viewer.py \
+  --paper-dir path/to/paper \
+  --default main.pdf \
+  --port 8788
 ```
 
-Windows PowerShell shortcut:
+Windows PowerShell shortcuts:
 ```powershell
 .\start_viewer.ps1 -Pdf "path\to\paper\main.pdf" -Zh "path\to\main_zh.json" -Port 8788
+.\start_viewer.ps1 -PaperDir "path\to\paper" -Default "main.pdf" -Port 8788
 ```
 
 Open `http://127.0.0.1:8788/` in your browser (or IDE side-pane browser).
@@ -81,14 +92,15 @@ Copy `skill/bilingual-paper-workflow/SKILL.md` into your AI agent's skills direc
 > Please read `README.md` and `zh_template.json`, generate a paragraph-by-paragraph Chinese companion JSON for `<path/to/main.tex>` and `<path/to/main.pdf>`, launch `paper_viewer.py` on port `8788`, and keep the companion JSON synchronized whenever `.tex` is edited and recompiled.
 
 ### Optional: Hard-Lock `PreToolUse` Hook (`paper_lock.py`)
-Register `paper_lock.py --hook` as a `PreToolUse` hook in your agent configuration (e.g., Antigravity / Claude Code) to enforce paragraph/section locks stored in `<stem>.locks.json`:
+`paper_lock.py --hook` natively supports both **Antigravity** (`hooks.json`) and **Claude Code** (`settings.json`) `PreToolUse` hook protocols.
 
+#### Antigravity (`.agents/hooks.json` or global `hooks.json`)
 ```json
 {
-  "hooks": {
+  "chengmen-paper-lock": {
     "PreToolUse": [
       {
-        "matcher": "edit_file|write_file|run_command|Edit|Write|Bash",
+        "matcher": "edit_file|write_file|run_command",
         "hooks": [
           {
             "type": "command",
@@ -99,6 +111,30 @@ Register `paper_lock.py --hook` as a `PreToolUse` hook in your agent configurati
     ]
   }
 }
+```
+
+#### Claude Code (`.claude/settings.json` or `~/.claude/settings.json`)
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"/abs/path/to/paper_lock.py\" --hook"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### Optional: Inspect Lock State via CLI
+```bash
+python paper_lock.py status path/to/paper/main.pdf
 ```
 
 ---
@@ -131,12 +167,16 @@ See [`zh_template.json`](zh_template.json) for a full starter template:
 ```
 
 ### Field Reference
-- **`id`** *(required, unique)*: Short reference tag (`Title`, `Abstract`, `1-P1`, `Fig1`, `Tab1`, `AppA-P1`). Setting `"id": "Title"` automatically binds to the title banner on Page 1.
+- **Top-level `"file"`**: Target PDF filename (used to guard against loading/locking the wrong PDF when switching files).
+- **Top-level `"tex"`** *(optional)*: Path to the source `.tex` file (relative to the companion JSON or PDF directory, or absolute). Honored by `paper_lock.py` when `.pdf` and `.tex` live in different directories (e.g., `-output-directory=build`); falls back to `<pdf_stem>.tex` alongside the PDF if omitted or not found.
+- **`id`** *(required, unique)*: Short reference tag (`Title`, `Abstract`, `1-P1`, `Fig1`, `Tab1`, `AppA-P1`). Setting `"id": "Title"` automatically binds to the title banner on Page 1 and locates `\title{...}` / `\icmltitle{...}` in `.tex`.
+- **`zh`** *(recommended)*: Chinese paragraph/caption companion text (supports `\n` line breaks).
 - **`kind`** *(optional)*: `"prose"` (default), `"figure"` (graphic above caption, e.g., `anchor: "Figure 1."`), or `"table"` (caption above table body, e.g., `anchor: "Table 1."`).
 - **`anchor`** *(recommended)*: First 4–8 English words appearing in the compiled PDF block (auto-derived from `en_preview` if omitted).
+- **`section`**, **`title`**, **`lines`**, **`en_preview`** *(recommended)*: Display metadata and fallback matching hints for UI cards and whole-section lock grouping.
 - **`sent_align`** *(optional)*: Explicit mapping from each Chinese sentence index to English sentence index list(s) (e.g. `[[0], [1], [2, 3]]`); overrides automatic DP alignment when exact 1-to-1 alignment is desired.
-- **`page`**: Initial hint; dynamically updated from the live PDF on every compile.
-- **`is_todo`**: Marks unfinished sections with an amber badge and enables one-click `仅待写` filtering.
+- **`page`** *(optional)*: Initial hint; dynamically updated from the live PDF on every compile.
+- **`is_todo`** *(optional)*: Marks unfinished sections with an amber badge and enables one-click `仅待写` filtering.
 
 ---
 

@@ -8,17 +8,30 @@ Usage:
     python paper_viewer.py --paper-dir "path/to/paper_dir" --default "main.pdf" --port 8788
 """
 
+from __future__ import annotations
+
 import argparse
+from collections import OrderedDict
 import http.server
+import inspect
 import json
 import re
+import secrets
 import sys
 import threading
 import time
 import urllib.parse
 from pathlib import Path
+from typing import Any, Callable
 
 import pymupdf
+
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        if _stream is not None and hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import paper_lock
@@ -29,12 +42,78 @@ DEFAULT_FILE: str = ""
 EXPLICIT_ZH_PATH: Path | None = None
 PORT: int = 8788
 RENDER_SCALE: float = 2.8
+MAX_POST_BODY_BYTES: int = 1_048_576  # 1 MiB
+SESSION_TOKEN: str = secrets.token_urlsafe(32)
+
+
+class _LRUCache(OrderedDict):
+    """Bounded LRU cache with optional total-byte cap and predicate eviction."""
+
+    def __init__(
+        self,
+        max_items: int = 64,
+        max_bytes: int | None = None,
+        size_fn: Callable[[Any], int] | None = None,
+    ):
+        super().__init__()
+        self.max_items = max(1, int(max_items))
+        self.max_bytes = max_bytes
+        self._size_fn = size_fn
+        self._total_bytes = 0
+
+    def _entry_size(self, value: Any) -> int:
+        if self._size_fn is None:
+            return 0
+        try:
+            return max(0, int(self._size_fn(value)))
+        except Exception:
+            return 0
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        if key in self:
+            self.move_to_end(key)
+            return super().__getitem__(key)
+        return default
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        if key in self:
+            self._total_bytes -= self._entry_size(super().__getitem__(key))
+            super().__delitem__(key)
+        super().__setitem__(key, value)
+        self._total_bytes += self._entry_size(value)
+        self._enforce_limits()
+
+    def __delitem__(self, key: Any) -> None:
+        val = super().__getitem__(key)
+        self._total_bytes -= self._entry_size(val)
+        super().__delitem__(key)
+
+    def clear(self) -> None:
+        super().clear()
+        self._total_bytes = 0
+
+    def evict_where(self, predicate: Callable[[Any], bool]) -> None:
+        for k in [k for k in list(self.keys()) if predicate(k)]:
+            del self[k]
+
+    def _enforce_limits(self) -> None:
+        while len(self) > self.max_items:
+            _, val = self.popitem(last=False)
+            self._total_bytes -= self._entry_size(val)
+        if self.max_bytes is not None:
+            while len(self) > 1 and self._total_bytes > self.max_bytes:
+                _, val = self.popitem(last=False)
+                self._total_bytes -= self._entry_size(val)
+
 
 _cache_lock = threading.Lock()
-_page_cache: dict[tuple[str, float, int, str], bytes] = {}
-_meta_cache: dict[tuple[str, float], dict] = {}
-_text_cache: dict[tuple[str, float], dict] = {}
-_region_cache: dict[tuple[str, float, float], tuple[list[dict], dict[str, dict]]] = {}
+_mupdf_lock = threading.Lock()
+_locks_io_lock = threading.Lock()
+
+_page_cache: _LRUCache = _LRUCache(max_items=96, max_bytes=128 * 1024 * 1024, size_fn=len)
+_meta_cache: _LRUCache = _LRUCache(max_items=16)
+_text_cache: _LRUCache = _LRUCache(max_items=16)
+_region_cache: _LRUCache = _LRUCache(max_items=16)
 
 ABBREVS = {
     "al.", "e.g.", "i.e.", "cf.", "vs.", "etc.", "fig.", "figs.", "tab.", "tabs.",
@@ -42,21 +121,29 @@ ABBREVS = {
     "mism.", "orig.", "sh.", "fwd.", "pp.", "tok.", "ms.", "no.", "vol.", "proc.",
 }
 
+# General academic bilingual hints for sentence-level alignment across paper domains
 ZH_EN_HINTS = [
-    ("置零", "zero"), ("全零", "zero"), ("错配", "swap"), ("错配", "mism"),
-    ("交换", "swap"), ("匹配", "match"), ("循环", "circular"), ("轮转", "rotation"),
-    ("位置偏置", "position"), ("偏置", "bias"), ("自校正", "self-correction"),
-    ("预填充", "prefill"), ("门控", "gate"), ("对照", "control"), ("干扰", "distractor"),
-    ("支持", "support"), ("金标准", "gold"), ("翻转", "flip"), ("反事实", "counterfactual"),
-    ("对称", "symmetric"), ("不对称", "asymmetric"), ("透镜", "lens"), ("岭", "ridge"),
-    ("单向量", "single-vector"), ("单向量", "single vector"), ("单个向量", "single vector"),
-    ("词表", "vocabulary"), ("解码", "decod"), ("白盒", "white-box"),
-    ("离线", "offline"), ("在线", "online"), ("停止", "stops"), ("置信区间", "ci"),
-    ("自助法", "bootstrap"), ("平衡准确率", "balanced"), ("盲答", "blind"),
-    ("背景", "background"), ("私有", "private"), ("逐题", "item-level"),
-    ("融合器", "fuser"), ("任务能力", "competence"), ("判断", "judgment"),
-    ("预实验", "pilot"), ("直读", "direct-reading"),
+    ("摘要", "abstract"), ("引言", "introduction"), ("相关工作", "related work"),
+    ("方法", "method"), ("框架", "framework"), ("模型", "model"),
+    ("实验", "experiment"), ("消融", "ablation"), ("基线", "baseline"),
+    ("结论", "conclusion"), ("局限", "limitation"), ("附录", "appendix"),
+    ("数据集", "dataset"), ("基准", "benchmark"), ("准确率", "accuracy"),
+    ("训练", "training"), ("推理", "inference"), ("延迟", "latency"),
+    ("吞吐", "throughput"), ("内存", "memory"), ("显著", "significant"),
+    ("置信区间", "ci"), ("对照", "control"), ("评估", "evaluat"),
+    ("定理", "theorem"), ("引理", "lemma"), ("命题", "proposition"),
+    ("证明", "proof"), ("公式", "equation"), ("算法", "algorithm"),
+    ("表格", "table"), ("图表", "figure"), ("参数", "parameter"),
+    ("梯度", "gradient"), ("损失", "loss"), ("优化", "optimiz"),
+    ("解码", "decod"), ("编码", "encod"), ("注意力", "attention"),
+    ("复杂度", "complexity"), ("泛化", "generaliz"), ("鲁棒", "robust"),
 ]
+
+_STANDARD_HEADINGS = {
+    "abstract", "references", "acknowledgments", "acknowledgements",
+    "impact statement", "broader impact", "ethics statement",
+    "reproducibility statement", "limitations", "appendix", "conclusion",
+}
 
 _ZH_SENT_RE = re.compile(r'[^\n。！？!?]+(?:[。！？!?]+[」”’）\)\]]*)?|\n+')
 
@@ -83,7 +170,7 @@ def _is_heading_words(ws: list[tuple]) -> bool:
     line_set = {(w[0], w[6], w[7]) for w in ws}
     txt = " ".join(w[5] for w in ws).strip()
     if len(line_set) <= 2 and len(txt) < 96:
-        if re.match(r'^(\d+(\.\d+)*\.?|[A-Z]\.)\s+[A-Z]', txt) or txt in ("Abstract", "AI Disclosure Statement"):
+        if re.match(r'^(\d+(\.\d+)*\.?|[A-Z]\.)\s+[A-Z]', txt) or txt.lower() in _STANDARD_HEADINGS:
             return True
     return False
 
@@ -241,7 +328,16 @@ def _align_zh_en(zh_cleans: list[str], en_texts: list[str]) -> list[list[int]]:
                     back[ni][nj] = (i, j)
 
     if back[K][M] is None:
-        return [[min(M - 1, round(z * (M - 1) / max(1, K - 1)))] for z in range(K)]
+        if M >= K:
+            fallback: list[list[int]] = []
+            for z in range(K):
+                lo = int(z * M / K)
+                hi = int((z + 1) * M / K)
+                if hi <= lo:
+                    hi = min(M, lo + 1)
+                fallback.append(list(range(lo, hi)))
+            return fallback
+        return [[min(M - 1, int(z * M / K))] for z in range(K)]
 
     mapping: list[list[int]] = [[] for _ in range(K)]
     ci, cj = K, M
@@ -270,11 +366,17 @@ def _norm(text: str) -> str:
     return s.strip()
 
 
+def _safe_str(val: Any) -> str:
+    if val is None:
+        return ""
+    return val if isinstance(val, str) else str(val)
+
+
 def _item_anchor_phrase(item: dict) -> str:
-    anc = (item.get("anchor") or "").strip()
+    anc = _safe_str(item.get("anchor")).strip()
     if anc:
         return _norm(anc)
-    prev = (item.get("en_preview") or "").strip()
+    prev = _safe_str(item.get("en_preview")).strip()
     prev = re.sub(r"\\section\{([^}]*)\}", r"\1", prev)
     prev = re.sub(r"\[TODO[^\]]*\]", "", prev)
     words = _norm(prev).split()
@@ -313,387 +415,535 @@ def _merge_rects_by_column(rects: list[tuple[float, float, float, float]], page_
     return merged
 
 
-def _is_margin_line_number(x0: float, x1: float, txt: str, pw: float) -> bool:
-    if x1 < pw * 0.105 and x1 - x0 < 36:
-        stripped = re.sub(r"\s+", "", txt)
-        if stripped.isdigit():
-            return True
-    return False
+def _estimate_body_left_x(words_or_spans: list[tuple[float, str]], pw: float) -> float | None:
+    """Estimate left margin x0 of main body text so genuine body/table digits are never stripped."""
+    xs = sorted(
+        x0 for x0, txt in words_or_spans
+        if pw * 0.055 <= x0 <= pw * 0.45 and re.search(r"[A-Za-z]{2}", txt)
+    )
+    if len(xs) < 4:
+        return None
+    return xs[len(xs) // 20]
 
 
-def build_regions(pdf_path: Path, pdf_mtime: float, zh_mtime: float, items: list[dict]) -> tuple[list[dict], dict[str, dict]]:
-    key = (pdf_path.name, pdf_mtime, zh_mtime)
+def _is_margin_line_number(
+    x0: float,
+    x1: float,
+    txt: str,
+    pw: float,
+    body_left_x: float | None = None,
+) -> bool:
+    stripped = re.sub(r"\s+", "", txt)
+    if not stripped or not stripped.isdigit() or len(stripped) > 4:
+        return False
+    if x1 - x0 >= 36:
+        return False
+    if body_left_x is not None:
+        return x1 <= body_left_x - 3.5
+    return x1 < pw * 0.080
+
+
+def _read_pdf_snapshot(path: Path) -> tuple[bytes, float, int, int, bool]:
+    """Atomically snapshot PDF bytes and verify stat stability against live LaTeX recompilation."""
+    data = b""
+    st2 = path.stat()
+    for attempt in range(3):
+        st1 = path.stat()
+        data = path.read_bytes()
+        st2 = path.stat()
+        if (
+            st1.st_mtime_ns == st2.st_mtime_ns
+            and st1.st_size == st2.st_size
+            and len(data) == st2.st_size
+        ):
+            return data, st2.st_mtime, st2.st_mtime_ns, st2.st_size, True
+        if attempt < 2:
+            time.sleep(0.02)
+    return data, st2.st_mtime, st2.st_mtime_ns, len(data), False
+
+
+def _parse_manual_sent_align(manual_align: Any, n_zh: int, n_en: int) -> list[list[int]] | None:
+    if not isinstance(manual_align, list) or len(manual_align) != n_zh:
+        return None
+    out: list[list[int]] = []
+    for grp in manual_align:
+        if not isinstance(grp, list):
+            return None
+        row: list[int] = []
+        for m in grp:
+            if isinstance(m, bool):
+                return None
+            try:
+                mi = int(m)
+            except (TypeError, ValueError):
+                return None
+            if 0 <= mi < n_en:
+                row.append(mi)
+        out.append(row)
+    return out
+
+
+def build_regions(
+    pdf_path: Path,
+    pdf_mtime: float,
+    zh_mtime: float,
+    items: list[dict],
+    pdf_cache_ver: tuple[int, int] | None = None,
+) -> tuple[list[dict], dict[str, dict]]:
+    if pdf_cache_ver is None:
+        st = pdf_path.stat()
+        pdf_cache_ver = (st.st_mtime_ns, st.st_size)
+    key = (pdf_path.name, pdf_cache_ver, zh_mtime)
     with _cache_lock:
         cached = _region_cache.get(key)
         if cached is not None:
             return cached
 
-    doc = pymupdf.open(pdf_path)
-    try:
-        float_items = [it for it in items if it.get("kind") in ("figure", "table")]
-        prose_items = [it for it in items if it.get("kind") not in ("figure", "table")]
+    pdf_bytes, _, snap_ns, snap_size, stable = _read_pdf_snapshot(pdf_path)
+    key = (pdf_path.name, (snap_ns, snap_size), zh_mtime)
 
-        prose_anchors = [(it["id"], _item_anchor_phrase(it)) for it in prose_items]
-        float_anchors = [(it["id"], it.get("kind"), _item_anchor_phrase(it)) for it in float_items]
+    with _mupdf_lock:
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            float_items = [it for it in items if it.get("kind") in ("figure", "table")]
+            prose_items = [it for it in items if it.get("kind") not in ("figure", "table")]
 
-        page_dims: list[tuple[float, float]] = []
-        raw_blocks_per_page: list[list[tuple[float, float, float, float, str, str, int, float]]] = []
-        words_by_page_bno: dict[tuple[int, int], list[tuple]] = {}
-        body_fs_samples: list[float] = []
+            prose_anchors = [(it["id"], _item_anchor_phrase(it)) for it in prose_items]
+            float_anchors = [(it["id"], it.get("kind"), _item_anchor_phrase(it)) for it in float_items]
 
-        for p_idx, page in enumerate(doc):
-            pw, ph = float(page.rect.width), float(page.rect.height)
-            page_dims.append((pw, ph))
-            dict_blks = page.get_text("dict").get("blocks", [])
-            fs_by_bbox: dict[tuple[float, float, float, float], float] = {}
-            for db in dict_blks:
-                if db.get("type") != 0:
-                    continue
-                w_sum, c_sum = 0.0, 0
-                for ln in db.get("lines", []):
-                    for sp in ln.get("spans", []):
-                        st = sp.get("text", "").strip()
-                        if st:
-                            n_ch = len(st)
-                            w_sum += float(sp.get("size", 0.0)) * n_ch
-                            c_sum += n_ch
-                if c_sum > 0:
-                    fs_val = w_sum / c_sum
-                    bx0, by0, bx1, by1 = db["bbox"]
-                    fs_by_bbox[(round(bx0, 1), round(by0, 1), round(bx1, 1), round(by1, 1))] = fs_val
-                    if c_sum >= 120 and by0 >= ph * 0.08 and by1 <= ph * 0.90 and not _is_margin_line_number(bx0, bx1, "0", pw):
-                        body_fs_samples.append(fs_val)
+            page_dims: list[tuple[float, float]] = []
+            raw_blocks_per_page: list[list[tuple[float, float, float, float, str, str, int, float]]] = []
+            words_by_page_bno: dict[tuple[int, int], list[tuple]] = {}
+            body_fs_samples: list[float] = []
 
-            blks = []
-            for b in page.get_text("blocks"):
-                x0, y0, x1, y1, txt, bno, btype = b
-                if btype != 0:
-                    continue
-                if _is_margin_line_number(x0, x1, txt, pw):
-                    continue
-                if y1 < ph * 0.072:  # running header
-                    continue
-                if y0 > ph * 0.915:  # page number footer
-                    continue
-                ntxt = _norm(txt)
-                if not ntxt:
-                    continue
-                bfs = fs_by_bbox.get((round(x0, 1), round(y0, 1), round(x1, 1), round(y1, 1)), 0.0)
-                blks.append((x0, y0, x1, y1, txt, ntxt, int(bno), bfs))
-            raw_blocks_per_page.append(blks)
+            for p_idx, page in enumerate(doc):
+                pw = float(page.rect.width) or 1.0
+                ph = float(page.rect.height) or 1.0
+                page_dims.append((pw, ph))
 
-            for w in page.get_text("words"):
-                wx0, wy0, wx1, wy1, wstr, bno, lno, wno = w
-                if _is_margin_line_number(wx0, wx1, wstr, pw):
-                    continue
-                words_by_page_bno.setdefault((p_idx, int(bno)), []).append(
-                    (p_idx, float(wx0), float(wy0), float(wx1), float(wy1), str(wstr), int(bno), int(lno), int(wno))
+                page_words = page.get_text("words")
+                body_left_x = _estimate_body_left_x(
+                    [(float(w[0]), str(w[4])) for w in page_words], pw
                 )
 
-        if body_fs_samples:
-            body_fs_samples.sort()
-            body_fs = body_fs_samples[len(body_fs_samples) // 2]
-        else:
-            body_fs = 10.0
+                dict_blks = page.get_text("dict").get("blocks", [])
+                fs_by_bbox: dict[tuple[float, float, float, float], float] = {}
+                for db in dict_blks:
+                    if db.get("type") != 0:
+                        continue
+                    w_sum, c_sum = 0.0, 0
+                    for ln in db.get("lines", []):
+                        for sp in ln.get("spans", []):
+                            st_txt = sp.get("text", "").strip()
+                            if st_txt:
+                                n_ch = len(st_txt)
+                                w_sum += float(sp.get("size", 0.0)) * n_ch
+                                c_sum += n_ch
+                    if c_sum > 0:
+                        fs_val = w_sum / c_sum
+                        bx0, by0, bx1, by1 = db["bbox"]
+                        fs_by_bbox[(round(bx0, 1), round(by0, 1), round(bx1, 1), round(by1, 1))] = fs_val
+                        if (
+                            c_sum >= 120
+                            and by0 >= ph * 0.08
+                            and by1 <= ph * 0.90
+                            and not _is_margin_line_number(bx0, bx1, "0", pw, body_left_x)
+                        ):
+                            body_fs_samples.append(fs_val)
 
-        for k_pb in words_by_page_bno:
-            words_by_page_bno[k_pb].sort(key=lambda x: (x[7], x[8]))
+                blks = []
+                for b in page.get_text("blocks"):
+                    x0, y0, x1, y1, txt, bno, btype = b
+                    if btype != 0:
+                        continue
+                    if _is_margin_line_number(x0, x1, txt, pw, body_left_x):
+                        continue
+                    if y1 < ph * 0.072:  # running header
+                        continue
+                    if y0 > ph * 0.915:  # page number footer
+                        continue
+                    ntxt = _norm(txt)
+                    if not ntxt:
+                        continue
+                    bfs = fs_by_bbox.get((round(x0, 1), round(y0, 1), round(x1, 1), round(y1, 1)), 0.0)
+                    blks.append((x0, y0, x1, y1, txt, ntxt, int(bno), bfs))
+                raw_blocks_per_page.append(blks)
 
-        float_boxes_per_page: list[list[tuple[str, tuple[float, float, float, float]]]] = [[] for _ in range(len(doc))]
-        item_blocks_by_id: dict[str, list[tuple[int, int]]] = {}
-        matched_float_ids: set[str] = set()
+                for w in page_words:
+                    wx0, wy0, wx1, wy1, wstr, bno, lno, wno = w
+                    if _is_margin_line_number(wx0, wx1, str(wstr), pw, body_left_x):
+                        continue
+                    words_by_page_bno.setdefault((p_idx, int(bno)), []).append(
+                        (p_idx, float(wx0), float(wy0), float(wx1), float(wy1), str(wstr), int(bno), int(lno), int(wno))
+                    )
 
-        for p_idx, blks in enumerate(raw_blocks_per_page):
-            pw, ph = page_dims[p_idx]
-            mid = pw / 2.0
-            for fid, fkind, fanc in float_anchors:
-                if fid in matched_float_ids or not fanc:
-                    continue
-                cap_blk = None
-                for b in blks:
-                    if b[5].startswith(fanc) or (fanc in b[5] and b[5].startswith(("figure ", "fig. ", "table ", "tab. "))):
-                        cap_blk = b
-                        break
-                if cap_blk is None:
-                    continue
-                matched_float_ids.add(fid)
-                cx0, cy0, cx1, cy1 = cap_blk[0], cap_blk[1], cap_blk[2], cap_blk[3]
-                is_wide = (cx0 < mid - 40 and cx1 > mid + 40)
-                cap_b_list = [(p_idx, cap_blk[6])]
+            if body_fs_samples:
+                body_fs_samples.sort()
+                body_fs = body_fs_samples[len(body_fs_samples) // 2]
+            else:
+                body_fs = 10.0
 
-                if fkind == "figure":
-                    cap_end_y = cy1
+            for k_pb in words_by_page_bno:
+                words_by_page_bno[k_pb].sort(key=lambda x: (x[7], x[8]))
+
+            float_boxes_per_page: list[list[tuple[str, tuple[float, float, float, float]]]] = [[] for _ in range(len(doc))]
+            item_blocks_by_id: dict[str, list[tuple[int, int]]] = {}
+            matched_float_ids: set[str] = set()
+
+            float_stop_re = re.compile(r"^(?:figure|fig\.|table|tab\.)\s+(?:[a-z]\.)?\d+\b")
+
+            for p_idx, blks in enumerate(raw_blocks_per_page):
+                pw, ph = page_dims[p_idx]
+                mid = pw / 2.0
+                for fid, fkind, fanc in float_anchors:
+                    if fid in matched_float_ids or not fanc:
+                        continue
+                    cap_blk = None
                     for b in blks:
-                        if b is cap_blk:
-                            continue
-                        if b[1] >= cy0 - 2 and b[1] <= cap_end_y + 14 and b[0] >= cx0 - 15 and b[2] <= cx1 + 20:
+                        if b[5].startswith(fanc) or (fanc in b[5] and b[5].startswith(("figure ", "fig. ", "table ", "tab. "))):
+                            cap_blk = b
+                            break
+                    if cap_blk is None:
+                        continue
+                    matched_float_ids.add(fid)
+                    cx0, cy0, cx1, cy1 = cap_blk[0], cap_blk[1], cap_blk[2], cap_blk[3]
+                    is_wide = (cx0 < mid - 40 and cx1 > mid + 40)
+                    cap_b_list = [(p_idx, cap_blk[6])]
+
+                    if fkind == "figure":
+                        cap_end_y = cy1
+                        for b in blks:
+                            if b is cap_blk:
+                                continue
+                            if b[1] >= cy0 - 2 and b[1] <= cap_end_y + 14 and b[0] >= cx0 - 15 and b[2] <= cx1 + 20:
+                                if any(anc and b[5].startswith(anc) for _, anc in prose_anchors):
+                                    break
+                                cap_end_y = max(cap_end_y, b[3])
+                                cap_b_list.append((p_idx, b[6]))
+                        bx0 = pw * 0.08 if is_wide else max(pw * 0.08, cx0 - 6.0)
+                        bx1 = pw * 0.92 if is_wide else min(pw * 0.92, cx1 + 6.0)
+                        prose_above = [
+                            b[3] for b in blks
+                            if b[3] < cy0 - 24
+                            and b[0] < bx1 - 10 and b[2] > bx0 + 10
+                            and (
+                                (
+                                    (b[2] - b[0]) > pw * 0.56
+                                    and len(b[4]) >= 60
+                                    and b[0] < bx0 + 25
+                                    and b[4].strip().endswith((".", ":", "?", "!", ")", "]"))
+                                )
+                                or any(anc and b[5].startswith(anc) for _, anc in prose_anchors)
+                            )
+                        ]
+                        if prose_above:
+                            top_y = max(ph * 0.075, max(prose_above) + 4.0)
+                        elif cy0 < ph * 0.46:
+                            top_y = ph * 0.075
+                        else:
+                            top_y = max(ph * 0.075, cy0 - 110.0)
+                            for b in blks:
+                                if b[3] <= cy0 + 2 and b[1] >= cy0 - 135 and "[todo" in b[5]:
+                                    top_y = min(top_y, b[1] - 18.0)
+                        prev_floats_above = [
+                            fb[3] for _, fb in float_boxes_per_page[p_idx]
+                            if fb[3] < cy0 - 12 and fb[0] < bx1 - 10 and fb[2] > bx0 + 10
+                        ]
+                        if prev_floats_above:
+                            top_y = max(top_y, max(prev_floats_above) + 4.0)
+                        float_boxes_per_page[p_idx].append((fid, (bx0, top_y, bx1, cap_end_y + 4.0)))
+                    else:
+                        col_left = pw * 0.08 if is_wide else (pw * 0.08 if (cx0 + cx1) / 2.0 < mid else mid - 4.0)
+                        col_right = pw * 0.92 if is_wide else (mid - 6.0 if (cx0 + cx1) / 2.0 < mid else pw * 0.92)
+                        below = [
+                            b for b in blks
+                            if b[1] >= cy0 - 2
+                            and col_left <= (b[0] + b[2]) / 2.0 <= col_right
+                        ]
+                        below.sort(key=lambda b: b[1])
+                        end_y = cy1
+                        cap_end_y = cy1
+                        still_in_caption = True
+                        seen_table_body = False
+                        col_w = max(1.0, col_right - col_left)
+                        for b in below:
+                            if b is cap_blk:
+                                continue
+                            if b[5] == "references" or float_stop_re.match(b[5]):
+                                break
                             if any(anc and b[5].startswith(anc) for _, anc in prose_anchors):
                                 break
-                            cap_end_y = max(cap_end_y, b[3])
-                            cap_b_list.append((p_idx, b[6]))
-                    bx0 = pw * 0.08 if is_wide else max(pw * 0.08, cx0 - 6.0)
-                    bx1 = pw * 0.92 if is_wide else min(pw * 0.92, cx1 + 6.0)
-                    prose_above = [
-                        b[3] for b in blks
-                        if b[3] < cy0 - 24
-                        and b[0] < bx1 - 10 and b[2] > bx0 + 10
-                        and (
-                            (
-                                (b[2] - b[0]) > pw * 0.56
-                                and len(b[4]) >= 60
-                                and b[0] < bx0 + 25
-                                and b[4].strip().endswith((".", ":", "?", "!", ")", "]"))
-                            )
-                            or any(anc and b[5].startswith(anc) for _, anc in prose_anchors)
-                        )
-                    ]
-                    if prose_above:
-                        top_y = max(ph * 0.075, max(prose_above) + 4.0)
-                    elif cy0 < ph * 0.46:
-                        top_y = ph * 0.075
-                    else:
-                        top_y = max(ph * 0.075, cy0 - 110.0)
-                        for b in blks:
-                            if b[3] <= cy0 + 2 and b[1] >= cy0 - 135 and "[todo" in b[5]:
-                                top_y = min(top_y, b[1] - 18.0)
-                    prev_floats_above = [
-                        fb[3] for _, fb in float_boxes_per_page[p_idx]
-                        if fb[3] < cy0 - 12 and fb[0] < bx1 - 10 and fb[2] > bx0 + 10
-                    ]
-                    if prev_floats_above:
-                        top_y = max(top_y, max(prev_floats_above) + 4.0)
-                    float_boxes_per_page[p_idx].append((fid, (bx0, top_y, bx1, cap_end_y + 4.0)))
-                else:
-                    col_left = pw * 0.08 if is_wide else (pw * 0.08 if (cx0 + cx1) / 2.0 < mid else mid - 4.0)
-                    col_right = pw * 0.92 if is_wide else (mid - 6.0 if (cx0 + cx1) / 2.0 < mid else pw * 0.92)
-                    below = [
-                        b for b in blks
-                        if b[1] >= cy0 - 2
-                        and col_left <= (b[0] + b[2]) / 2.0 <= col_right
-                    ]
-                    below.sort(key=lambda b: b[1])
-                    end_y = cy1
-                    cap_end_y = cy1
-                    still_in_caption = True
-                    seen_table_body = False
-                    col_w = max(1.0, col_right - col_left)
-                    for b in below:
-                        if b is cap_blk:
-                            continue
-                        if b[5].startswith(("references", "figure ", "fig. ", "table ", "tab. ")):
-                            break
-                        if any(anc and b[5].startswith(anc) for _, anc in prose_anchors):
-                            break
-                        if b[1] > end_y + 40:
-                            break
-                        bfs = b[7]
-                        bw = b[2] - b[0]
-                        btxt_s = b[4].strip()
-                        # Stop before body-text prose paragraphs (e.g. cross-column continuations below a top-of-column table)
-                        if (not still_in_caption or b[1] > cap_end_y + 12) and bfs >= body_fs - 0.35 and (bw >= col_w * 0.55 or len(btxt_s) >= 45):
-                            break
-                        # Also stop if a large float-separation gap follows a table body and block is not a footnote
-                        if seen_table_body and b[1] > end_y + 16 and not btxt_s.startswith(("*", "∗", "†", "‡", "§", "◊", "Note", "note")):
-                            if bfs >= body_fs - 0.45:
+                            if b[1] > end_y + 40:
                                 break
-                        if still_in_caption and b[1] <= cap_end_y + 8 and (b[2] - b[0]) >= (cx1 - cx0) * 0.55:
-                            cap_b_list.append((p_idx, b[6]))
-                            cap_end_y = max(cap_end_y, b[3])
-                        else:
-                            still_in_caption = False
-                            seen_table_body = True
-                        end_y = max(end_y, b[3])
-                    float_boxes_per_page[p_idx].append((fid, (col_left, max(ph * 0.073, cy0 - 4.0), col_right, end_y + 6.0)))
-                item_blocks_by_id[fid] = cap_b_list
+                            bfs = b[7]
+                            bw = b[2] - b[0]
+                            btxt_s = b[4].strip()
+                            if (not still_in_caption or b[1] > cap_end_y + 12) and bfs >= body_fs - 0.35 and (bw >= col_w * 0.55 or len(btxt_s) >= 45):
+                                break
+                            if seen_table_body and b[1] > end_y + 16 and not btxt_s.startswith(("*", "∗", "†", "‡", "§", "◊", "Note", "note")):
+                                if bfs >= body_fs - 0.45:
+                                    break
+                            if still_in_caption and b[1] <= cap_end_y + 8 and (b[2] - b[0]) >= (cx1 - cx0) * 0.55:
+                                cap_b_list.append((p_idx, b[6]))
+                                cap_end_y = max(cap_end_y, b[3])
+                            else:
+                                still_in_caption = False
+                                seen_table_body = True
+                            end_y = max(end_y, b[3])
+                        float_boxes_per_page[p_idx].append((fid, (col_left, max(ph * 0.073, cy0 - 4.0), col_right, end_y + 6.0)))
+                    item_blocks_by_id[fid] = cap_b_list
 
-        prose_stream: list[tuple[int, tuple[float, float, float, float, str, str, int, float]]] = []
-        for p_idx, blks in enumerate(raw_blocks_per_page):
-            pw, ph = page_dims[p_idx]
-            mid = pw / 2.0
-            fboxes = float_boxes_per_page[p_idx]
+            prose_stream: list[tuple[int, tuple[float, float, float, float, str, str, int, float]]] = []
+            for p_idx, blks in enumerate(raw_blocks_per_page):
+                pw, ph = page_dims[p_idx]
+                mid = pw / 2.0
+                fboxes = float_boxes_per_page[p_idx]
 
-            def in_float(b):
-                cx = (b[0] + b[2]) / 2.0
-                cy = (b[1] + b[3]) / 2.0
-                for _, (fx0, fy0, fx1, fy1) in fboxes:
-                    if fx0 <= cx <= fx1 and fy0 <= cy <= fy1:
-                        return True
-                return False
+                def in_float(b):
+                    cx = (b[0] + b[2]) / 2.0
+                    cy = (b[1] + b[3]) / 2.0
+                    for _, (fx0, fy0, fx1, fy1) in fboxes:
+                        if fx0 <= cx <= fx1 and fy0 <= cy <= fy1:
+                            return True
+                    return False
 
-            pblks = [b for b in blks if not in_float(b)]
-            wide_blks = [b for b in pblks if (b[2] - b[0]) > pw * 0.56 and b[0] < mid - 40 and b[2] > mid + 40]
-            right_prose_blks = [b for b in pblks if b[0] > mid - 8 and (b[2] - b[0]) > pw * 0.24]
-            wide_chars = sum(len(b[4]) for b in wide_blks)
-            tot_chars = sum(len(b[4]) for b in pblks)
-            is_onecol = (
-                len(pblks) > 0
-                and len(wide_blks) >= 2
-                and len(right_prose_blks) < 2
-                and (wide_chars >= tot_chars * 0.35 or len(wide_blks) >= max(2, len(pblks) // 2))
-            )
+                pblks = [b for b in blks if not in_float(b)]
+                wide_blks = [b for b in pblks if (b[2] - b[0]) > pw * 0.56 and b[0] < mid - 40 and b[2] > mid + 40]
+                right_prose_blks = [b for b in pblks if b[0] > mid - 8 and (b[2] - b[0]) > pw * 0.24]
+                wide_chars = sum(len(b[4]) for b in wide_blks)
+                tot_chars = sum(len(b[4]) for b in pblks)
+                is_onecol = (
+                    len(pblks) > 0
+                    and len(wide_blks) >= 2
+                    and len(right_prose_blks) < 2
+                    and (wide_chars >= tot_chars * 0.35 or len(wide_blks) >= max(2, len(pblks) // 2))
+                )
 
-            if is_onecol:
-                pblks.sort(key=lambda b: (b[1], b[0]))
-            else:
-                full_top = [b for b in pblks if b[0] < mid - 60 and b[2] > mid + 60 and b[1] < ph * 0.28]
-                rest = [b for b in pblks if b not in full_top]
-                left_col = [b for b in rest if (b[0] + b[2]) / 2.0 < mid]
-                right_col = [b for b in rest if (b[0] + b[2]) / 2.0 >= mid]
-                full_top.sort(key=lambda b: b[1])
-                left_col.sort(key=lambda b: b[1])
-                right_col.sort(key=lambda b: b[1])
-                pblks = full_top + left_col + right_col
+                if is_onecol:
+                    pblks.sort(key=lambda b: (b[1], b[0]))
+                else:
+                    full_top = [b for b in pblks if b[0] < mid - 60 and b[2] > mid + 60 and b[1] < ph * 0.28]
+                    rest = [b for b in pblks if b not in full_top]
+                    left_col = [b for b in rest if (b[0] + b[2]) / 2.0 < mid]
+                    right_col = [b for b in rest if (b[0] + b[2]) / 2.0 >= mid]
+                    full_top.sort(key=lambda b: b[1])
+                    left_col.sort(key=lambda b: b[1])
+                    right_col.sort(key=lambda b: b[1])
+                    pblks = full_top + left_col + right_col
 
-            for b in pblks:
-                prose_stream.append((p_idx, b))
+                for b in pblks:
+                    prose_stream.append((p_idx, b))
 
-        item_page_rects: dict[tuple[str, int], list[tuple[float, float, float, float]]] = {}
-        current_id: str | None = None
-        used_prose_ids: set[str] = set()
-        has_title_item = any(pid == "Title" for pid, _ in prose_anchors)
+            item_page_rects: dict[tuple[str, int], list[tuple[float, float, float, float]]] = {}
+            current_id: str | None = None
+            used_prose_ids: set[str] = set()
+            has_title_item = any(pid == "Title" for pid, _ in prose_anchors)
+            title_anc = next((panc for pid, panc in prose_anchors if pid == "Title"), "")
+            p0_ph = page_dims[0][1] if page_dims else 792.0
+            p0_top_fs = [b[7] for p_i, b in prose_stream if p_i == 0 and b[1] < p0_ph * 0.25 and b[7] > 0]
+            max_top_fs = max(p0_top_fs) if p0_top_fs else body_fs
+            title_min_fs = max(body_fs + 1.5, max_top_fs - 1.5)
+            title_matched_fs: float | None = None
 
-        for p_idx, b in prose_stream:
-            ntxt = b[5]
-            if ntxt == "references" or ntxt.startswith("references "):
-                current_id = None
-                continue
+            ref_heading_re = re.compile(r"^(?:\d+\.?\s+)?references$")
 
-            if has_title_item and p_idx == 0 and b[1] < page_dims[0][1] * 0.195 and "anonymous" not in ntxt and ntxt != "abstract":
-                current_id = "Title"
-                used_prose_ids.add("Title")
-                item_page_rects.setdefault(("Title", p_idx), []).append((b[0], b[1], b[2], b[3]))
-                item_blocks_by_id.setdefault("Title", []).append((p_idx, b[6]))
-                continue
-
-            matched_id = None
-            for pid, panc in prose_anchors:
-                if not panc or pid in used_prose_ids:
+            for p_idx, b in prose_stream:
+                ntxt = b[5]
+                if len(ntxt) <= 24 and ref_heading_re.match(ntxt):
+                    current_id = None
                     continue
-                if ntxt.startswith(panc) or (len(panc) >= 12 and panc in ntxt):
-                    matched_id = pid
-                    break
 
-            if matched_id is not None:
-                current_id = matched_id
-                used_prose_ids.add(matched_id)
-
-            if current_id is not None:
-                if current_id == "Title" and ("anonymous" in ntxt or b[1] >= page_dims[0][1] * 0.195):
-                    continue
-                item_page_rects.setdefault((current_id, p_idx), []).append((b[0], b[1], b[2], b[3]))
-                item_blocks_by_id.setdefault(current_id, []).append((p_idx, b[6]))
-
-        regions: list[dict] = []
-        for p_idx, fboxes in enumerate(float_boxes_per_page):
-            pw, ph = page_dims[p_idx]
-            for fid, (x0, y0, x1, y1) in fboxes:
-                regions.append({
-                    "id": fid,
-                    "page": p_idx + 1,
-                    "col": 0,
-                    "rect": [
-                        round(max(0.0, x0 / pw), 4),
-                        round(max(0.0, y0 / ph), 4),
-                        round(min(1.0, x1 / pw), 4),
-                        round(min(1.0, y1 / ph), 4),
-                    ],
-                })
-
-        for (pid, p_idx), rlist in item_page_rects.items():
-            pw, ph = page_dims[p_idx]
-            merged = _merge_rects_by_column(rlist, pw)
-            for x0, y0, x1, y1 in merged:
-                pad_x, pad_y = 4.0, 2.5
-                col_rank = 0 if (x0 < pw * 0.35 and x1 > pw * 0.65) else (1 if (x0 + x1) / 2.0 < pw / 2.0 else 2)
-                regions.append({
-                    "id": pid,
-                    "page": p_idx + 1,
-                    "col": col_rank,
-                    "rect": [
-                        round(max(0.0, (x0 - pad_x) / pw), 4),
-                        round(max(0.0, (y0 - pad_y) / ph), 4),
-                        round(min(1.0, (x1 + pad_x) / pw), 4),
-                        round(min(1.0, (y1 + pad_y) / ph), 4),
-                    ],
-                })
-
-        regions.sort(key=lambda r: (r["page"], r["col"], r["rect"][1], r["rect"][0]))
-        for r in regions:
-            r.pop("col", None)
-
-        # Build bidirectional sentence-level alignment map per item
-        sentence_map: dict[str, dict] = {}
-        for it in items:
-            cid = it["id"]
-            zh_text = it.get("zh") or ""
-            iblocks = item_blocks_by_id.get(cid, [])
-            if not zh_text or not iblocks:
-                continue
-            zh_tokens, zh_cleans = split_zh_tokens(zh_text)
-            if not zh_cleans:
-                continue
-            keep_hd = ("标题" in zh_text[:20])
-            en_sents = _split_en_blocks_to_sentences(iblocks, words_by_page_bno, page_dims, keep_first_heading=keep_hd)
-            if not en_sents:
-                continue
-            manual_align = it.get("sent_align")
-            if isinstance(manual_align, list) and len(manual_align) == len(zh_cleans):
-                zh_to_en = [[int(m) for m in grp if 0 <= int(m) < len(en_sents)] for grp in manual_align]
-            else:
-                zh_to_en = _align_zh_en(zh_cleans, [e["text"] for e in en_sents])
-
-            en_to_zh: list[list[int]] = [[] for _ in range(len(en_sents))]
-            for z_i, e_list in enumerate(zh_to_en):
-                for e_i in e_list:
-                    if 0 <= e_i < len(en_sents) and z_i not in en_to_zh[e_i]:
-                        en_to_zh[e_i].append(z_i)
-            for e_i in range(len(en_sents)):
-                if not en_to_zh[e_i]:
-                    nearest_z = min(
-                        range(len(zh_cleans)),
-                        key=lambda z_i: abs((z_i + 0.5) / len(zh_cleans) - (e_i + 0.5) / len(en_sents)),
+                if has_title_item and p_idx == 0 and ntxt != "abstract":
+                    anc_hit = bool(title_anc and (ntxt.startswith(title_anc) or (len(title_anc) >= 12 and title_anc in ntxt)))
+                    fs_hit = (
+                        b[1] < p0_ph * 0.22
+                        and b[7] >= title_min_fs
+                        and "anonymous" not in ntxt
+                        and "Title" not in used_prose_ids
                     )
-                    en_to_zh[e_i] = [nearest_z]
-                en_sents[e_i]["zh"] = en_to_zh[e_i]
+                    if anc_hit or fs_hit:
+                        current_id = "Title"
+                        used_prose_ids.add("Title")
+                        title_matched_fs = b[7] if b[7] > 0 else max_top_fs
+                        item_page_rects.setdefault(("Title", p_idx), []).append((b[0], b[1], b[2], b[3]))
+                        item_blocks_by_id.setdefault("Title", []).append((p_idx, b[6]))
+                        continue
 
-            sentence_map[cid] = {
-                "zh_tokens": zh_tokens,
-                "zh_to_en": zh_to_en,
-                "en_sents": en_sents,
-            }
-    finally:
-        doc.close()
+                matched_id = None
+                for pid, panc in prose_anchors:
+                    if not panc or pid in used_prose_ids:
+                        continue
+                    if ntxt.startswith(panc) or (len(panc) >= 12 and panc in ntxt):
+                        matched_id = pid
+                        break
+
+                if matched_id is not None:
+                    current_id = matched_id
+                    used_prose_ids.add(matched_id)
+
+                if current_id is not None:
+                    if current_id == "Title":
+                        # Only keep genuine title continuation lines (matching title font size), never author/affiliation blocks
+                        min_cont_fs = max(body_fs + 1.5, (title_matched_fs or max_top_fs) - 1.5)
+                        if p_idx != 0 or b[1] >= p0_ph * 0.24 or "anonymous" in ntxt or b[7] < min_cont_fs:
+                            current_id = None
+                            continue
+                    item_page_rects.setdefault((current_id, p_idx), []).append((b[0], b[1], b[2], b[3]))
+                    item_blocks_by_id.setdefault(current_id, []).append((p_idx, b[6]))
+
+            regions: list[dict] = []
+            for p_idx, fboxes in enumerate(float_boxes_per_page):
+                pw, ph = page_dims[p_idx]
+                for fid, (x0, y0, x1, y1) in fboxes:
+                    regions.append({
+                        "id": fid,
+                        "page": p_idx + 1,
+                        "col": 0,
+                        "rect": [
+                            round(max(0.0, x0 / pw), 4),
+                            round(max(0.0, y0 / ph), 4),
+                            round(min(1.0, x1 / pw), 4),
+                            round(min(1.0, y1 / ph), 4),
+                        ],
+                    })
+
+            for (pid, p_idx), rlist in item_page_rects.items():
+                pw, ph = page_dims[p_idx]
+                merged = _merge_rects_by_column(rlist, pw)
+                for x0, y0, x1, y1 in merged:
+                    pad_x, pad_y = 4.0, 2.5
+                    col_rank = 0 if (x0 < pw * 0.35 and x1 > pw * 0.65) else (1 if (x0 + x1) / 2.0 < pw / 2.0 else 2)
+                    regions.append({
+                        "id": pid,
+                        "page": p_idx + 1,
+                        "col": col_rank,
+                        "rect": [
+                            round(max(0.0, (x0 - pad_x) / pw), 4),
+                            round(max(0.0, (y0 - pad_y) / ph), 4),
+                            round(min(1.0, (x1 + pad_x) / pw), 4),
+                            round(min(1.0, (y1 + pad_y) / ph), 4),
+                        ],
+                    })
+
+            regions.sort(key=lambda r: (r["page"], r["col"], r["rect"][1], r["rect"][0]))
+            for r in regions:
+                r.pop("col", None)
+
+            # Build bidirectional sentence-level alignment map per item
+            sentence_map: dict[str, dict] = {}
+            for it in items:
+                cid = it["id"]
+                zh_text = _safe_str(it.get("zh"))
+                iblocks = item_blocks_by_id.get(cid, [])
+                if not zh_text or not iblocks:
+                    continue
+                zh_tokens, zh_cleans = split_zh_tokens(zh_text)
+                if not zh_cleans:
+                    continue
+                keep_hd = ("标题" in zh_text[:20])
+                en_sents = _split_en_blocks_to_sentences(iblocks, words_by_page_bno, page_dims, keep_first_heading=keep_hd)
+                if not en_sents:
+                    continue
+                manual_zh_to_en = _parse_manual_sent_align(it.get("sent_align"), len(zh_cleans), len(en_sents))
+                if manual_zh_to_en is not None:
+                    zh_to_en = manual_zh_to_en
+                else:
+                    zh_to_en = _align_zh_en(zh_cleans, [e["text"] for e in en_sents])
+
+                en_to_zh: list[list[int]] = [[] for _ in range(len(en_sents))]
+                for z_i, e_list in enumerate(zh_to_en):
+                    for e_i in e_list:
+                        if 0 <= e_i < len(en_sents) and z_i not in en_to_zh[e_i]:
+                            en_to_zh[e_i].append(z_i)
+                for e_i in range(len(en_sents)):
+                    if not en_to_zh[e_i]:
+                        nearest_z = min(
+                            range(len(zh_cleans)),
+                            key=lambda z_i: abs((z_i + 0.5) / len(zh_cleans) - (e_i + 0.5) / len(en_sents)),
+                        )
+                        en_to_zh[e_i] = [nearest_z]
+                    en_sents[e_i]["zh"] = en_to_zh[e_i]
+
+                sentence_map[cid] = {
+                    "zh_tokens": zh_tokens,
+                    "zh_to_en": zh_to_en,
+                    "en_sents": en_sents,
+                }
+        finally:
+            doc.close()
 
     result = (regions, sentence_map)
-    with _cache_lock:
-        for k in [k for k in _region_cache if k[0] == pdf_path.name and k != key]:
-            del _region_cache[k]
-        _region_cache[key] = result
+    if stable:
+        with _cache_lock:
+            _region_cache.evict_where(lambda k: k[0] == pdf_path.name and k != key)
+            _region_cache[key] = result
     return result
 
 
 def list_pdfs() -> list[str]:
-    pdfs = sorted(
-        [p.name for p in PAPER_DIR.glob("*.pdf") if p.is_file()],
-        key=lambda name: (0 if name == DEFAULT_FILE else 1, name.lower()),
-    )
-    return pdfs
+    try:
+        root = PAPER_DIR.resolve()
+        if not root.exists() or not root.is_dir():
+            return []
+        entries = []
+        for p in root.iterdir():
+            if not p.is_file() or p.suffix.lower() != ".pdf":
+                continue
+            try:
+                rp = p.resolve()
+            except OSError:
+                continue
+            if root not in rp.parents:
+                continue
+            entries.append(p.name)
+    except OSError:
+        return []
+    return sorted(entries, key=lambda name: (0 if name == DEFAULT_FILE else 1, name.lower()))
 
 
 def resolve_pdf(name: str | None) -> Path:
+    if name is not None:
+        if not isinstance(name, str):
+            raise ValueError("Invalid file parameter")
+        if "/" in name or "\\" in name or ".." in name or "\x00" in name:
+            raise ValueError("Invalid file parameter")
     pdfs = list_pdfs()
-    chosen = name if name in pdfs else (DEFAULT_FILE if DEFAULT_FILE in pdfs else (pdfs[0] if pdfs else DEFAULT_FILE))
+    if not pdfs:
+        if DEFAULT_FILE:
+            candidate = (PAPER_DIR / DEFAULT_FILE).resolve()
+            if PAPER_DIR.resolve() in candidate.parents and candidate.is_file():
+                return candidate
+        raise FileNotFoundError(f"No PDF files found in directory: {PAPER_DIR.name}")
+    chosen = name if name in pdfs else (DEFAULT_FILE if DEFAULT_FILE in pdfs else pdfs[0])
     path = (PAPER_DIR / chosen).resolve()
     if PAPER_DIR.resolve() not in path.parents:
-        raise FileNotFoundError("Invalid path")
-    if not path.exists():
+        raise FileNotFoundError("Invalid PDF path")
+    if not path.is_file():
         raise FileNotFoundError(f"PDF not found: {chosen}")
     return path
 
 
+def _peek_zh_target_file(zh_path: Path) -> str | None:
+    try:
+        raw = json.loads(zh_path.read_text(encoding="utf-8-sig"))
+        if isinstance(raw, dict):
+            f = raw.get("file")
+            if isinstance(f, str) and f.strip():
+                return f.strip()
+    except Exception:
+        pass
+    return None
+
+
 def resolve_zh_path(pdf_path: Path) -> Path | None:
-    if EXPLICIT_ZH_PATH is not None and EXPLICIT_ZH_PATH.exists():
-        return EXPLICIT_ZH_PATH
+    if EXPLICIT_ZH_PATH is not None and EXPLICIT_ZH_PATH.is_file():
+        if DEFAULT_FILE and pdf_path.name == DEFAULT_FILE:
+            return EXPLICIT_ZH_PATH
+        tf = _peek_zh_target_file(EXPLICIT_ZH_PATH)
+        if tf is not None and tf == pdf_path.name:
+            return EXPLICIT_ZH_PATH
+        if not DEFAULT_FILE and tf is None and len(list_pdfs()) <= 1:
+            return EXPLICIT_ZH_PATH
     stem = pdf_path.stem
     candidates = [
         pdf_path.parent / ".paper_viewer" / f"{stem}_zh.json",
@@ -701,227 +951,405 @@ def resolve_zh_path(pdf_path: Path) -> Path | None:
         Path(__file__).resolve().parent / "companions" / f"{stem}_zh.json",
     ]
     for c in candidates:
-        if c.exists():
+        if c.is_file():
             return c
     return None
 
 
+def _sanitize_zh_items(raw_items: Any) -> tuple[list[dict], list[str]]:
+    if raw_items is None:
+        return [], ["'items' field is null; expected a list."]
+    if not isinstance(raw_items, list):
+        raise ValueError("Companion JSON 'items' must be a list")
+    cleaned: list[dict] = []
+    warnings: list[str] = []
+    for idx, it in enumerate(raw_items):
+        if not isinstance(it, dict):
+            warnings.append(f"Skipped invalid item at index {idx} (expected object)")
+            continue
+        raw_id = it.get("id")
+        if not isinstance(raw_id, str) or not raw_id.strip():
+            warnings.append(f"Skipped item at index {idx} missing valid string 'id'")
+            continue
+        item = dict(it)
+        item["id"] = raw_id.strip()
+        try:
+            pg = int(item.get("page", 1))
+            item["page"] = pg if pg >= 1 else 1
+        except (TypeError, ValueError):
+            item["page"] = 1
+        for k in ("lines", "section", "title", "anchor", "en_preview", "zh"):
+            if k in item:
+                item[k] = _safe_str(item[k])
+        if "kind" in item and item["kind"] is not None:
+            item["kind"] = _safe_str(item["kind"])
+        item["is_todo"] = bool(item.get("is_todo", False))
+        cleaned.append(item)
+    return cleaned, warnings
+
+
+def _load_zh_json(zh_path: Path) -> tuple[dict | None, str | None]:
+    try:
+        raw = json.loads(zh_path.read_text(encoding="utf-8-sig"))
+    except Exception as exc:
+        return None, str(exc)
+    if not isinstance(raw, dict):
+        return None, "Companion JSON root must be a JSON object"
+    if "items" in raw and not isinstance(raw.get("items"), list):
+        return None, "Companion JSON 'items' must be a list"
+    return raw, None
+
+
+def _call_tex_path_for(pdf_path: Path, tex_hint: str | None = None, base_dir: Path | None = None) -> Path:
+    hint = tex_hint.strip() if isinstance(tex_hint, str) and tex_hint.strip() else None
+    try:
+        sig = inspect.signature(paper_lock.tex_path_for)
+        if "tex_hint" in sig.parameters:
+            return paper_lock.tex_path_for(pdf_path, tex_hint=hint, base_dir=base_dir)
+    except Exception:
+        pass
+    if hint:
+        cand = Path(hint)
+        if not cand.is_absolute():
+            cand = (base_dir or pdf_path.parent) / cand
+        try:
+            rc = cand.resolve()
+            if rc.is_file():
+                return rc
+        except OSError:
+            pass
+    return paper_lock.tex_path_for(pdf_path)
+
+
+def _call_load_locks(pdf_path: Path) -> dict:
+    with _locks_io_lock:
+        if hasattr(paper_lock, "get_locks_for_pdf"):
+            try:
+                return paper_lock.get_locks_for_pdf(pdf_path)
+            except TypeError:
+                pass
+        try:
+            sig = inspect.signature(paper_lock.load_locks)
+            if "strict" in sig.parameters:
+                return paper_lock.load_locks(pdf_path, strict=False)
+        except Exception:
+            pass
+        return paper_lock.load_locks(pdf_path)
+
+
+def _call_update_locks_for_pdf(
+    pdf_path: Path,
+    items: list[dict],
+    action: str,
+    ids: list[str],
+    mode: str | None,
+    tex_path: Path | None = None,
+) -> dict:
+    with _locks_io_lock:
+        sig = inspect.signature(paper_lock.update_locks_for_pdf)
+        if "tex_path" in sig.parameters:
+            return paper_lock.update_locks_for_pdf(
+                pdf_path,
+                action=action,
+                ids=ids,
+                mode=mode,
+                items=items,
+                tex_path=tex_path,
+            )
+        return paper_lock.update_locks_for_pdf(pdf_path, items, action=action, ids=ids, mode=mode)
+
+
 def get_meta(filename: str | None) -> dict:
     path = resolve_pdf(filename)
-    mtime = path.stat().st_mtime
-    key = (path.name, mtime)
+    st = path.stat()
+    key = (path.name, st.st_mtime_ns, st.st_size)
     with _cache_lock:
-        if key in _meta_cache:
-            data = dict(_meta_cache[key])
-            data["files"] = list_pdfs()
-            return data
+        cached = _meta_cache.get(key)
+    if cached is not None:
+        data = dict(cached)
+        data["files"] = list_pdfs()
+        return data
 
-    doc = pymupdf.open(path)
-    try:
-        pages = [{"w": round(p.rect.width, 1), "h": round(p.rect.height, 1)} for p in doc]
-        toc = [{"level": lvl, "title": title, "page": page} for lvl, title, page in doc.get_toc()]
+    pdf_bytes, mtime, snap_ns, snap_size, stable = _read_pdf_snapshot(path)
+    key = (path.name, snap_ns, snap_size)
+
+    with _mupdf_lock:
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
         try:
-            named_dests = doc.resolve_names() or {}
-        except Exception:
-            named_dests = {}
-        links_per_page: list[list[dict]] = []
-        n_pages = len(doc)
-        for p in doc:
-            pw, ph = float(p.rect.width) or 1.0, float(p.rect.height) or 1.0
-            plinks: list[dict] = []
-            for lnk in p.get_links():
-                fr = lnk.get("from")
-                if not fr:
-                    continue
-                rect_n = [
-                    round(max(0.0, fr.x0 / pw), 4),
-                    round(max(0.0, fr.y0 / ph), 4),
-                    round(min(1.0, fr.x1 / pw), 4),
-                    round(min(1.0, fr.y1 / ph), 4),
-                ]
-                kind = lnk.get("kind")
-                if kind == pymupdf.LINK_URI and lnk.get("uri"):
-                    uri = str(lnk["uri"]).strip()
-                    if uri.startswith(("http://", "https://", "mailto:")):
-                        plinks.append({"r": rect_n, "t": "uri", "u": uri})
-                elif kind in (pymupdf.LINK_GOTO, pymupdf.LINK_NAMED):
-                    dst_p = lnk.get("page")
-                    to_pt = lnk.get("to")
-                    ndest = str(lnk.get("nameddest") or "")
-                    is_pdf_bottom_up = (kind == pymupdf.LINK_NAMED)
-                    if (dst_p is None or dst_p < 0) and ndest and ndest in named_dests:
-                        resolved = named_dests[ndest]
-                        dst_p = resolved.get("page")
-                        to_pt = resolved.get("to")
-                        is_pdf_bottom_up = True
-                    if isinstance(dst_p, int) and 0 <= dst_p < n_pages:
-                        dpw = float(doc[dst_p].rect.width) or 1.0
-                        dph = float(doc[dst_p].rect.height) or 1.0
-                        tx, ty = 0.0, 0.0
-                        if to_pt is not None:
-                            try:
-                                raw_x = float(to_pt.x) if hasattr(to_pt, "x") else float(to_pt[0])
-                                raw_y = float(to_pt.y) if hasattr(to_pt, "y") else float(to_pt[1])
-                                tx = max(0.0, min(1.0, raw_x / dpw))
-                                y_top = (dph - raw_y) if is_pdf_bottom_up else raw_y
-                                ty = max(0.0, min(1.0, y_top / dph))
-                            except Exception:
-                                tx, ty = 0.0, 0.0
-                        entry = {"r": rect_n, "t": "goto", "p": dst_p + 1, "x": round(tx, 4), "y": round(ty, 4)}
-                        if ndest:
-                            entry["d"] = ndest
-                        plinks.append(entry)
-            links_per_page.append(plinks)
-        info = {
-            "file": path.name,
-            "files": list_pdfs(),
-            "page_count": n_pages,
-            "mtime": mtime,
-            "mtime_str": time.strftime("%H:%M:%S", time.localtime(mtime)),
-            "pages": pages,
-            "toc": toc,
-            "links": links_per_page,
-        }
-    finally:
-        doc.close()
+            pages = [{"w": round(float(p.rect.width) or 1.0, 1), "h": round(float(p.rect.height) or 1.0, 1)} for p in doc]
+            toc = [{"level": lvl, "title": title, "page": page} for lvl, title, page in doc.get_toc()]
+            try:
+                named_dests = doc.resolve_names() or {}
+            except Exception:
+                named_dests = {}
+            links_per_page: list[list[dict]] = []
+            n_pages = len(doc)
+            for p in doc:
+                pw, ph = float(p.rect.width) or 1.0, float(p.rect.height) or 1.0
+                plinks: list[dict] = []
+                for lnk in p.get_links():
+                    fr = lnk.get("from")
+                    if not fr:
+                        continue
+                    rect_n = [
+                        round(max(0.0, fr.x0 / pw), 4),
+                        round(max(0.0, fr.y0 / ph), 4),
+                        round(min(1.0, fr.x1 / pw), 4),
+                        round(min(1.0, fr.y1 / ph), 4),
+                    ]
+                    kind = lnk.get("kind")
+                    if kind == pymupdf.LINK_URI and lnk.get("uri"):
+                        uri = str(lnk["uri"]).strip()
+                        if uri.lower().startswith(("http://", "https://", "mailto:")):
+                            plinks.append({"r": rect_n, "t": "uri", "u": uri})
+                    elif kind in (pymupdf.LINK_GOTO, pymupdf.LINK_NAMED):
+                        dst_p = lnk.get("page")
+                        to_pt = lnk.get("to")
+                        ndest = str(lnk.get("nameddest") or "")
+                        is_pdf_bottom_up = (kind == pymupdf.LINK_NAMED)
+                        if (dst_p is None or dst_p < 0) and ndest and ndest in named_dests:
+                            resolved = named_dests[ndest]
+                            dst_p = resolved.get("page")
+                            to_pt = resolved.get("to")
+                            is_pdf_bottom_up = True
+                        if isinstance(dst_p, int) and 0 <= dst_p < n_pages:
+                            dpw = float(doc[dst_p].rect.width) or 1.0
+                            dph = float(doc[dst_p].rect.height) or 1.0
+                            tx, ty = 0.0, 0.0
+                            if to_pt is not None:
+                                try:
+                                    raw_x = float(to_pt.x) if hasattr(to_pt, "x") else float(to_pt[0])
+                                    raw_y = float(to_pt.y) if hasattr(to_pt, "y") else float(to_pt[1])
+                                    tx = max(0.0, min(1.0, raw_x / dpw))
+                                    y_top = (dph - raw_y) if is_pdf_bottom_up else raw_y
+                                    ty = max(0.0, min(1.0, y_top / dph))
+                                except Exception:
+                                    tx, ty = 0.0, 0.0
+                            entry = {"r": rect_n, "t": "goto", "p": dst_p + 1, "x": round(tx, 4), "y": round(ty, 4)}
+                            if ndest:
+                                entry["d"] = ndest
+                            plinks.append(entry)
+                links_per_page.append(plinks)
+            info = {
+                "file": path.name,
+                "files": list_pdfs(),
+                "page_count": n_pages,
+                "mtime": mtime,
+                "mtime_str": time.strftime("%H:%M:%S", time.localtime(mtime)),
+                "pages": pages,
+                "toc": toc,
+                "links": links_per_page,
+            }
+        finally:
+            doc.close()
 
-    with _cache_lock:
-        for k in [k for k in _meta_cache if k[0] == path.name and k[1] != mtime]:
-            del _meta_cache[k]
-        for k in [k for k in _page_cache if k[0] == path.name and k[1] != mtime]:
-            del _page_cache[k]
-        for k in [k for k in _text_cache if k[0] == path.name and k[1] != mtime]:
-            del _text_cache[k]
-        _meta_cache[key] = info
+    if stable:
+        with _cache_lock:
+            _meta_cache.evict_where(lambda k: k[0] == path.name and k != key)
+            _page_cache.evict_where(lambda k: k[0] == path.name and (k[1], k[2]) != (snap_ns, snap_size))
+            _text_cache.evict_where(lambda k: k[0] == path.name and k != key)
+            _meta_cache[key] = info
     return info
 
 
 def get_text_layer(filename: str | None) -> dict:
     path = resolve_pdf(filename)
-    mtime = path.stat().st_mtime
-    key = (path.name, mtime)
+    st = path.stat()
+    key = (path.name, st.st_mtime_ns, st.st_size)
     with _cache_lock:
         cached = _text_cache.get(key)
         if cached is not None:
             return cached
 
-    doc = pymupdf.open(path)
+    pdf_bytes, mtime, snap_ns, snap_size, stable = _read_pdf_snapshot(path)
+    key = (path.name, snap_ns, snap_size)
+
     pages_out: list[dict] = []
-    try:
-        for page in doc:
-            pw, ph = float(page.rect.width), float(page.rect.height)
-            mid = pw / 2.0
-            words = page.get_text("words")
-            by_line: dict[tuple[int, int], list[tuple]] = {}
-            for wx0, wy0, wx1, wy1, wstr, bno, lno, wno in words:
-                if _is_margin_line_number(wx0, wx1, str(wstr), pw):
-                    continue
-                by_line.setdefault((int(bno), int(lno)), []).append(
-                    (float(wx0), float(wy0), float(wx1), float(wy1), str(wstr), int(wno))
-                )
+    with _mupdf_lock:
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            for page in doc:
+                pw = float(page.rect.width) or 1.0
+                ph = float(page.rect.height) or 1.0
+                mid = pw / 2.0
 
-            raw_runs: list[tuple[float, float, float, float, str, int, int]] = []
-            for (bno, lno), wl in by_line.items():
-                wl.sort(key=lambda w: w[5])
-                cur = [wl[0]]
-                for w in wl[1:]:
-                    if w[0] - cur[-1][2] > 14.0:
-                        rx0 = min(x[0] for x in cur)
-                        ry0 = min(x[1] for x in cur)
-                        rx1 = max(x[2] for x in cur)
-                        ry1 = max(x[3] for x in cur)
-                        raw_runs.append((rx0, ry0, rx1, ry1, " ".join(x[4] for x in cur), bno, lno))
-                        cur = [w]
-                    else:
-                        cur.append(w)
-                rx0 = min(x[0] for x in cur)
-                ry0 = min(x[1] for x in cur)
-                rx1 = max(x[2] for x in cur)
-                ry1 = max(x[3] for x in cur)
-                raw_runs.append((rx0, ry0, rx1, ry1, " ".join(x[4] for x in cur), bno, lno))
+                dict_blks = page.get_text("dict").get("blocks", [])
+                # Collect horizontal spans first to estimate body left margin and exclude rotated/vertical text
+                horiz_spans_for_margin: list[tuple[float, str]] = []
+                horiz_lines: list[tuple[int, int, list[tuple[float, float, float, float, str]]]] = []
+                for db in dict_blks:
+                    if db.get("type") != 0:
+                        continue
+                    bno = int(db.get("number", 0))
+                    for lno, ln in enumerate(db.get("lines", [])):
+                        ldir = ln.get("dir", (1.0, 0.0))
+                        dx = float(ldir[0]) if len(ldir) >= 1 else 1.0
+                        # Skip vertical / strongly rotated text (e.g. figure y-axis labels)
+                        if abs(dx) < 0.7:
+                            continue
+                        span_items: list[tuple[float, float, float, float, str]] = []
+                        for sp in ln.get("spans", []):
+                            stxt = str(sp.get("text") or "")
+                            if not stxt.strip():
+                                continue
+                            sb = sp.get("bbox")
+                            if not sb or len(sb) != 4:
+                                continue
+                            sx0, sy0, sx1, sy1 = float(sb[0]), float(sb[1]), float(sb[2]), float(sb[3])
+                            span_items.append((sx0, sy0, sx1, sy1, stxt))
+                            horiz_spans_for_margin.append((sx0, stxt))
+                        if span_items:
+                            horiz_lines.append((bno, lno, span_items))
 
-            wide_cnt = sum(1 for r in raw_runs if (r[2] - r[0]) > pw * 0.56 and r[0] < mid - 40 and r[2] > mid + 40)
-            right_prose_cnt = sum(1 for r in raw_runs if r[0] > mid - 8 and (r[2] - r[0]) > pw * 0.24)
-            is_onecol = len(raw_runs) > 0 and wide_cnt >= 3 and right_prose_cnt < 3
-            if is_onecol:
-                raw_runs.sort(key=lambda r: (round(r[1], 1), r[0]))
-            else:
-                top_full = [r for r in raw_runs if r[0] < mid - 55 and r[2] > mid + 55 and r[1] < ph * 0.28]
-                top_set = set(range(len(raw_runs)))
-                top_ids = {i for i, r in enumerate(raw_runs) if r[0] < mid - 55 and r[2] > mid + 55 and r[1] < ph * 0.28}
-                rest = [raw_runs[i] for i in top_set - top_ids]
-                left_c = [r for r in rest if (r[0] + r[2]) / 2.0 < mid]
-                right_c = [r for r in rest if (r[0] + r[2]) / 2.0 >= mid]
-                top_full.sort(key=lambda r: (round(r[1], 1), r[0]))
-                left_c.sort(key=lambda r: (round(r[1], 1), r[0]))
-                right_c.sort(key=lambda r: (round(r[1], 1), r[0]))
-                raw_runs = top_full + left_c + right_c
+                body_left_x = _estimate_body_left_x(horiz_spans_for_margin, pw)
 
-            compact_runs: list[list] = []
-            for idx, r in enumerate(raw_runs):
-                rx0, ry0, rx1, ry1, rtxt, bno, _lno = r
-                sep = " "
-                if idx + 1 < len(raw_runs):
-                    nxt = raw_runs[idx + 1]
-                    if nxt[5] != bno or abs(nxt[1] - ry0) > 22.0:
-                        sep = "\n"
-                compact_runs.append([
-                    round(rx0, 2),
-                    round(ry0, 2),
-                    round(max(1.0, rx1 - rx0), 2),
-                    round(max(4.0, ry1 - ry0), 2),
-                    rtxt,
-                    sep,
-                ])
-            pages_out.append({"w": round(pw, 2), "h": round(ph, 2), "runs": compact_runs})
-    finally:
-        doc.close()
+                raw_runs: list[tuple[float, float, float, float, str, int, int]] = []
+                for bno, lno, spans in horiz_lines:
+                    filtered_spans = [
+                        sp for sp in spans
+                        if not _is_margin_line_number(sp[0], sp[2], sp[4], pw, body_left_x)
+                    ]
+                    if not filtered_spans:
+                        continue
+                    filtered_spans.sort(key=lambda s: s[0])
+
+                    def _flush_spans(grp: list[tuple[float, float, float, float, str]]) -> None:
+                        rx0 = min(x[0] for x in grp)
+                        ry0 = min(x[1] for x in grp)
+                        rx1 = max(x[2] for x in grp)
+                        ry1 = max(x[3] for x in grp)
+                        # Defensive guard against degenerate vertical bounding boxes
+                        if (ry1 - ry0) > (rx1 - rx0) * 1.8 and (ry1 - ry0) > 20.0:
+                            return
+                        parts: list[str] = []
+                        prev_x1: float | None = None
+                        for sx0, _sy0, sx1, _sy1, stxt in grp:
+                            if prev_x1 is not None:
+                                gap = sx0 - prev_x1
+                                if gap > 1.2 and parts and not parts[-1].endswith(" ") and not stxt.startswith(" "):
+                                    parts.append(" ")
+                            parts.append(stxt)
+                            prev_x1 = sx1
+                        rtxt = "".join(parts).strip()
+                        if rtxt:
+                            raw_runs.append((rx0, ry0, rx1, ry1, rtxt, bno, lno))
+
+                    cur = [filtered_spans[0]]
+                    for sp in filtered_spans[1:]:
+                        if sp[0] - cur[-1][2] > 14.0:
+                            _flush_spans(cur)
+                            cur = [sp]
+                        else:
+                            cur.append(sp)
+                    _flush_spans(cur)
+
+                wide_cnt = sum(1 for r in raw_runs if (r[2] - r[0]) > pw * 0.56 and r[0] < mid - 40 and r[2] > mid + 40)
+                right_prose_cnt = sum(1 for r in raw_runs if r[0] > mid - 8 and (r[2] - r[0]) > pw * 0.24)
+                is_onecol = len(raw_runs) > 0 and wide_cnt >= 3 and right_prose_cnt < 3
+                if is_onecol:
+                    raw_runs.sort(key=lambda r: (round(r[1], 1), r[0]))
+                else:
+                    top_ids = {
+                        i for i, r in enumerate(raw_runs)
+                        if r[0] < mid - 55 and r[2] > mid + 55 and r[1] < ph * 0.28
+                    }
+                    top_full = [raw_runs[i] for i in top_ids]
+                    rest = [raw_runs[i] for i in range(len(raw_runs)) if i not in top_ids]
+                    left_c = [r for r in rest if (r[0] + r[2]) / 2.0 < mid]
+                    right_c = [r for r in rest if (r[0] + r[2]) / 2.0 >= mid]
+                    top_full.sort(key=lambda r: (round(r[1], 1), r[0]))
+                    left_c.sort(key=lambda r: (round(r[1], 1), r[0]))
+                    right_c.sort(key=lambda r: (round(r[1], 1), r[0]))
+                    raw_runs = top_full + left_c + right_c
+
+                compact_runs: list[list] = []
+                for idx, r in enumerate(raw_runs):
+                    rx0, ry0, rx1, ry1, rtxt, bno, _lno = r
+                    sep = " "
+                    if idx + 1 < len(raw_runs):
+                        nxt = raw_runs[idx + 1]
+                        if nxt[5] != bno or abs(nxt[1] - ry0) > 22.0:
+                            sep = "\n"
+                    compact_runs.append([
+                        round(rx0, 2),
+                        round(ry0, 2),
+                        round(max(1.0, rx1 - rx0), 2),
+                        round(max(4.0, ry1 - ry0), 2),
+                        rtxt,
+                        sep,
+                    ])
+                pages_out.append({"w": round(pw, 2), "h": round(ph, 2), "runs": compact_runs})
+        finally:
+            doc.close()
 
     res = {"file": path.name, "mtime": mtime, "pages": pages_out}
-    with _cache_lock:
-        _text_cache[key] = res
+    if stable:
+        with _cache_lock:
+            _text_cache.evict_where(lambda k: k[0] == path.name and k != key)
+            _text_cache[key] = res
     return res
 
 
 def get_zh_companion(filename: str | None) -> dict:
     pdf_path = resolve_pdf(filename)
-    pdf_mtime = pdf_path.stat().st_mtime
+    pdf_st = pdf_path.stat()
+    pdf_mtime = pdf_st.st_mtime
     resolved_name = pdf_path.name
     zh_path = resolve_zh_path(pdf_path)
-    if zh_path is None or not zh_path.exists():
+    if zh_path is None or not zh_path.is_file():
         return {
             "available": False,
+            "file": resolved_name,
             "mtime": 0,
             "pdf_mtime": pdf_mtime,
+            "locks_mtime": 0.0,
             "mtime_str": "--:--:--",
             "note": f"未找到 {pdf_path.stem}_zh.json（可用 --zh 指定路径）",
             "items": [],
             "regions": [],
         }
     mtime = zh_path.stat().st_mtime
-    try:
-        raw = json.loads(zh_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        return {"available": False, "mtime": mtime, "pdf_mtime": pdf_mtime, "mtime_str": "--:--:--", "error": str(exc), "items": [], "regions": []}
+    raw, err = _load_zh_json(zh_path)
+    if err is not None or raw is None:
+        return {
+            "available": False,
+            "file": resolved_name,
+            "mtime": mtime,
+            "pdf_mtime": pdf_mtime,
+            "locks_mtime": 0.0,
+            "mtime_str": "--:--:--",
+            "error": err or "Invalid companion JSON",
+            "items": [],
+            "regions": [],
+        }
 
-    target_file = raw.get("file", resolved_name)
+    target_file = _safe_str(raw.get("file") or resolved_name).strip()
     if target_file and resolved_name != target_file:
         return {
             "available": False,
+            "file": resolved_name,
             "mtime": mtime,
             "pdf_mtime": pdf_mtime,
+            "locks_mtime": 0.0,
             "mtime_str": time.strftime("%H:%M:%S", time.localtime(mtime)),
             "note": f"当前中文对照对应 {target_file}",
             "items": [],
             "regions": [],
         }
 
-    items = [dict(it) for it in raw.get("items", [])]
-    regions, sentence_map = build_regions(pdf_path, pdf_mtime, mtime, items)
+    items, item_warnings = _sanitize_zh_items(raw.get("items", []))
+    regions, sentence_map = build_regions(
+        pdf_path,
+        pdf_mtime,
+        mtime,
+        items,
+        pdf_cache_ver=(pdf_st.st_mtime_ns, pdf_st.st_size),
+    )
     lp = paper_lock.lock_path_for(pdf_path)
     locks_mtime = lp.stat().st_mtime if lp.exists() else 0.0
-    ldata = paper_lock.load_locks(pdf_path)
+    ldata = _call_load_locks(pdf_path)
     locked_set = set((ldata.get("locks") or {}).keys())
+    tex_path = _call_tex_path_for(pdf_path, tex_hint=raw.get("tex"), base_dir=zh_path.parent)
     primary_page: dict[str, int] = {}
     for r in regions:
         primary_page.setdefault(r["id"], r["page"])
@@ -932,10 +1360,11 @@ def get_zh_companion(filename: str | None) -> dict:
             it["sent_map"] = sentence_map[it["id"]]
         it["section_group"] = paper_lock.section_group_key(it)
         it["locked"] = it["id"] in locked_set
-    return {
+    out = {
         "available": True,
         "file": resolved_name,
-        "title_zh": raw.get("title_zh", ""),
+        "tex": tex_path.name,
+        "title_zh": _safe_str(raw.get("title_zh")),
         "mtime": mtime,
         "pdf_mtime": pdf_mtime,
         "locks_mtime": locks_mtime,
@@ -945,53 +1374,68 @@ def get_zh_companion(filename: str | None) -> dict:
         "items": items,
         "regions": regions,
     }
+    if item_warnings:
+        out["warnings"] = item_warnings
+    return out
 
 
 def render_page_svg(filename: str | None, page_idx: int) -> tuple[bytes, float]:
     path = resolve_pdf(filename)
-    mtime = path.stat().st_mtime
-    key = (path.name, mtime, page_idx, "svg")
+    st = path.stat()
+    key = (path.name, st.st_mtime_ns, st.st_size, page_idx, "svg")
     with _cache_lock:
         cached = _page_cache.get(key)
         if cached is not None:
-            return cached, mtime
+            return cached, st.st_mtime
 
-    doc = pymupdf.open(path)
-    try:
-        if page_idx < 0 or page_idx >= len(doc):
-            raise IndexError("Page out of range")
-        page = doc[page_idx]
-        svg_str = page.get_svg_image(matrix=pymupdf.Identity, text_as_path=True)
-        svg_bytes = svg_str.encode("utf-8")
-    finally:
-        doc.close()
+    pdf_bytes, mtime, snap_ns, snap_size, stable = _read_pdf_snapshot(path)
+    key = (path.name, snap_ns, snap_size, page_idx, "svg")
 
-    with _cache_lock:
-        _page_cache[key] = svg_bytes
+    with _mupdf_lock:
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            if page_idx < 0 or page_idx >= len(doc):
+                raise IndexError("Page out of range")
+            page = doc[page_idx]
+            svg_str = page.get_svg_image(matrix=pymupdf.Identity, text_as_path=True)
+            svg_bytes = svg_str.encode("utf-8")
+        finally:
+            doc.close()
+
+    if stable:
+        with _cache_lock:
+            _page_cache.evict_where(lambda k: k[0] == path.name and (k[1], k[2]) != (snap_ns, snap_size))
+            _page_cache[key] = svg_bytes
     return svg_bytes, mtime
 
 
 def render_page_png(filename: str | None, page_idx: int) -> tuple[bytes, float]:
     path = resolve_pdf(filename)
-    mtime = path.stat().st_mtime
-    key = (path.name, mtime, page_idx, "png")
+    st = path.stat()
+    key = (path.name, st.st_mtime_ns, st.st_size, page_idx, "png")
     with _cache_lock:
         cached = _page_cache.get(key)
         if cached is not None:
-            return cached, mtime
+            return cached, st.st_mtime
 
-    doc = pymupdf.open(path)
-    try:
-        if page_idx < 0 or page_idx >= len(doc):
-            raise IndexError("Page out of range")
-        page = doc[page_idx]
-        pix = page.get_pixmap(matrix=pymupdf.Matrix(RENDER_SCALE, RENDER_SCALE), alpha=False)
-        png_bytes = pix.tobytes("png")
-    finally:
-        doc.close()
+    pdf_bytes, mtime, snap_ns, snap_size, stable = _read_pdf_snapshot(path)
+    key = (path.name, snap_ns, snap_size, page_idx, "png")
 
-    with _cache_lock:
-        _page_cache[key] = png_bytes
+    with _mupdf_lock:
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            if page_idx < 0 or page_idx >= len(doc):
+                raise IndexError("Page out of range")
+            page = doc[page_idx]
+            pix = page.get_pixmap(matrix=pymupdf.Matrix(RENDER_SCALE, RENDER_SCALE), alpha=False)
+            png_bytes = pix.tobytes("png")
+        finally:
+            doc.close()
+
+    if stable:
+        with _cache_lock:
+            _page_cache.evict_where(lambda k: k[0] == path.name and (k[1], k[2]) != (snap_ns, snap_size))
+            _page_cache[key] = png_bytes
     return png_bytes, mtime
 
 
@@ -1000,21 +1444,24 @@ def search_pdf(filename: str | None, query: str) -> list[dict]:
     if not q:
         return []
     path = resolve_pdf(filename)
-    doc = pymupdf.open(path)
+    pdf_bytes, _, _, _, _ = _read_pdf_snapshot(path)
     matches = []
-    try:
-        q_lower = q.lower()
-        for idx, page in enumerate(doc):
-            text = page.get_text("text")
-            pos = text.lower().find(q_lower)
-            if pos != -1:
-                count = text.lower().count(q_lower)
-                start = max(0, pos - 40)
-                end = min(len(text), pos + len(q) + 60)
-                snippet = " ".join(text[start:end].split())
-                matches.append({"page": idx + 1, "count": count, "snippet": snippet})
-    finally:
-        doc.close()
+    with _mupdf_lock:
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            q_lower = q.lower()
+            for idx, page in enumerate(doc):
+                text = page.get_text("text")
+                text_lower = text.lower()
+                pos = text_lower.find(q_lower)
+                if pos != -1:
+                    count = text_lower.count(q_lower)
+                    start = max(0, pos - 40)
+                    end = min(len(text), pos + len(q) + 60)
+                    snippet = " ".join(text[start:end].split())
+                    matches.append({"page": idx + 1, "count": count, "snippet": snippet})
+        finally:
+            doc.close()
     return matches
 
 
@@ -1794,7 +2241,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div id="hoverPill" class="hover-pill"></div>
   <div id="toast" class="toast"></div>
 
-  <script>
+  <script nonce="__CSP_NONCE__">
+    const VIEWER_TOKEN = __VIEWER_SESSION_TOKEN__;
     let currentFile = new URLSearchParams(location.search).get('file') || '';
     let currentMeta = null;
     let currentZh = null;
@@ -1817,7 +2265,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     let enSentRectsByPage = {}; // page -> [{ itemId, enIdx, zhIndices, rect }]
     let pdfLinksByPage = {};    // page -> [{ r:[x0,y0,x1,y1], t:'goto'|'uri', p?, x?, y?, d?, u? }]
     let hoveredPdfLink = null;  // { page, link }
-    let jumpHistory = [];       // [{ scrollTop, scrollLeft, page, zhScroll, selectedZhId, activeSent }]
+    let jumpHistory = [];       // [{ scrollRatioY, scrollRatioX, page, zhScroll, selectedZhId, activeSent }]
 
     let zhVisible = localStorage.getItem('paper_zh_visible') !== '0';
     let splitDir = localStorage.getItem('paper_split_dir') || (window.innerWidth < 760 ? 'col' : 'row');
@@ -1825,8 +2273,34 @@ HTML_PAGE = r"""<!DOCTYPE html>
     let autoFollow = localStorage.getItem('paper_zh_follow') !== '0';
     let showPdfLockMarks = localStorage.getItem('paper_pdf_lock_marks') === '1';
     let suppressNextAutoFollow = false;
+    let suppressAutoFollowTimer = null;
+    let lastRenderedFilterPage = null;
+    let fileSwitchEpoch = 0;
+    let metaInFlight = false;
+    let zhInFlight = false;
+    let metaAbortCtrl = null;
+    let zhAbortCtrl = null;
+    let textAbortCtrl = null;
+    let pollTimer = null;
     let lockedSet = new Set();
     let lockMode = 'deny';
+
+    function suppressAutoFollowBriefly(ms = 750) {
+      suppressNextAutoFollow = true;
+      if (suppressAutoFollowTimer) clearTimeout(suppressAutoFollowTimer);
+      suppressAutoFollowTimer = setTimeout(() => {
+        suppressNextAutoFollow = false;
+        suppressAutoFollowTimer = null;
+      }, ms);
+    }
+
+    function itemMatchesPage(item, pageNum) {
+      if (!item) return false;
+      if (Number(item.page) === pageNum) return true;
+      const regs = regionsById[item.id];
+      if (Array.isArray(regs) && regs.some(r => Number(r.page) === pageNum)) return true;
+      return false;
+    }
 
     const fileSelect = document.getElementById('fileSelect');
     const viewer = document.getElementById('viewer');
@@ -2041,8 +2515,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     function pushJumpHistory() {
       jumpHistory.push({
-        scrollTop: viewer.scrollTop,
-        scrollLeft: viewer.scrollLeft,
+        scrollRatioY: viewer.scrollHeight > 0 ? viewer.scrollTop / viewer.scrollHeight : 0,
+        scrollRatioX: viewer.scrollWidth > 0 ? viewer.scrollLeft / viewer.scrollWidth : 0,
         page: currentPage,
         zhScroll: zhList ? zhList.scrollTop : 0,
         selectedZhId,
@@ -2080,7 +2554,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       pushJumpHistory();
       const targetPage = Math.max(1, Math.min(currentMeta ? currentMeta.page_count : lnk.p, Number(lnk.p)));
       const pageCard = viewer.querySelector(`.page-card[data-page="${targetPage}"]`);
-      suppressNextAutoFollow = true;
+      suppressAutoFollowBriefly(750);
       currentPage = targetPage;
       pageInput.value = targetPage;
       if (pageCard) {
@@ -2099,27 +2573,29 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
       highlightZhCards(true);
       showToast(formatPdfLinkLabel(lnk) + '（点「↩ 返回」或按 Alt+← 可回到原处）');
-      setTimeout(() => { suppressNextAutoFollow = false; }, 750);
     }
 
     function goBackJump() {
       if (!jumpHistory.length) return;
       const prev = jumpHistory.pop();
       updateBackJumpBtn();
-      suppressNextAutoFollow = true;
-      currentPage = prev.page;
-      pageInput.value = prev.page;
+      suppressAutoFollowBriefly(750);
+      const maxPage = currentMeta ? currentMeta.page_count : prev.page;
+      const safePage = Math.max(1, Math.min(maxPage || 1, Number(prev.page) || 1));
+      currentPage = safePage;
+      pageInput.value = safePage;
       selectedZhId = prev.selectedZhId;
       activeSent = prev.activeSent;
-      viewer.scrollTo({ left: prev.scrollLeft, top: prev.scrollTop, behavior: 'smooth' });
+      const targetTop = Math.round((prev.scrollRatioY || 0) * viewer.scrollHeight);
+      const targetLeft = Math.round((prev.scrollRatioX || 0) * viewer.scrollWidth);
+      viewer.scrollTo({ left: targetLeft, top: targetTop, behavior: 'smooth' });
       renderPdfOverlays();
       highlightZhCards(false);
       updateZhSentenceClasses();
       if (zhList && typeof prev.zhScroll === 'number') {
         zhList.scrollTo({ top: prev.zhScroll, behavior: 'smooth' });
       }
-      showToast(`已返回第 ${prev.page} 页原位置`);
-      setTimeout(() => { suppressNextAutoFollow = false; }, 750);
+      showToast(`已返回第 ${safePage} 页原位置`);
     }
 
     function renderPdfLinkHoverOverlay() {
@@ -2274,7 +2750,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (mode) payload.mode = mode;
         const res = await fetch('/api/locks', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Viewer-Token': VIEWER_TOKEN,
+          },
           body: JSON.stringify(payload),
         });
         const data = await res.json();
@@ -2293,8 +2772,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
         renderLockControls();
         renderZhPane(true);
         renderPdfLockOverlays();
+        const unmatched = Array.isArray(data.unmatched) ? data.unmatched : [];
+        const warnings = Array.isArray(data.warnings) ? data.warnings : [];
         if (action === 'set_mode') {
           showToast(lockMode === 'deny' ? '已切换为：硬锁禁改模式（Agent 绝对无法修改锁定段）' : '已切换为：强询问模式（Agent 碰触锁定段时强制弹窗确认）');
+        } else if (warnings.length > 0) {
+          showToast(warnings[0]);
+        } else if (unmatched.length > 0) {
+          showToast(`未能在 .tex 中定位 ${unmatched.join(', ')}（未写入空锁，当前共锁定 ${lockedSet.size} 处）`);
         } else {
           const n = lockedSet.size;
           showToast(`已更新锁定状态（当前共锁定 ${n} 处）`);
@@ -2321,7 +2806,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
       if (lockModeAskBtn) lockModeAskBtn.classList.toggle('active', lockMode === 'force_ask');
       if (pdfLockMarkBtn) pdfLockMarkBtn.classList.toggle('active', showPdfLockMarks);
 
-      if (!lockSecList || !currentZh || !currentZh.available) return;
+      if (!lockSecList) return;
+      if (!currentZh || !currentZh.available) {
+        lockSecList.textContent = '';
+        return;
+      }
       const groups = [];
       const gMap = {};
       (currentZh.items || []).forEach(it => {
@@ -2446,7 +2935,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
         zhFilterMode = 'all';
         localStorage.setItem('paper_zh_filter', 'all');
         needRerender = true;
-      } else if (zhFilterMode === 'page' && Number(item.page) !== currentPage) {
+      } else if (zhFilterMode === 'locked' && !lockedSet.has(item.id)) {
+        zhFilterMode = 'all';
+        localStorage.setItem('paper_zh_filter', 'all');
+        needRerender = true;
+      } else if (zhFilterMode === 'page' && !itemMatchesPage(item, currentPage)) {
         zhFilterMode = 'all';
         localStorage.setItem('paper_zh_filter', 'all');
         needRerender = true;
@@ -2701,6 +3194,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     function populateTextLayers(textData) {
       if (!textData || !Array.isArray(textData.pages)) return;
+      if (currentMeta && textData.file && textData.file !== currentMeta.file) return;
       viewer.querySelectorAll('.page-card').forEach(card => {
         const pIdx = Number(card.dataset.page) - 1;
         const tl = card.querySelector('.page-text-layer');
@@ -2713,13 +3207,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
         (pInfo.runs || []).forEach(run => {
           const [x0, y0, rw, rh, txt, sep] = run;
           if (!txt) return;
-          const fsPt = Math.max(4.5, rh * 0.86);
+          // Defensive skip for degenerate vertical/rotated bounding boxes
+          if (rh > rw * 1.8 && rh > 20) return;
+          const fsPt = Math.max(4.5, Math.min(36, rh * 0.86));
           _measureCtx.font = `${fsPt.toFixed(2)}px "Times New Roman", Times, Georgia, serif`;
           const natW = Math.max(1.0, _measureCtx.measureText(txt).width);
           const sx = Math.max(0.55, Math.min(1.65, rw / natW));
 
           const sp = document.createElement('span');
           sp.className = 'pdf-tl-span';
+          sp.dataset.x0 = (x0 / pw).toFixed(4);
+          sp.dataset.x1 = ((x0 + rw) / pw).toFixed(4);
           sp.dataset.nx = ((x0 + rw * 0.5) / pw).toFixed(4);
           sp.dataset.ny = ((y0 + rh * 0.5) / ph).toFixed(4);
           sp.style.left = ((x0 / pw) * 100).toFixed(3) + '%';
@@ -2734,19 +3232,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
       });
     }
 
-    async function loadTextLayer() {
+    async function loadTextLayer(expectedFile = currentFile, epoch = fileSwitchEpoch) {
+      if (textAbortCtrl) textAbortCtrl.abort();
+      textAbortCtrl = new AbortController();
+      const signal = textAbortCtrl.signal;
       try {
-        const url = `/api/text${currentFile ? '?file=' + encodeURIComponent(currentFile) : ''}`;
-        const res = await fetch(url, { cache: 'no-store' });
+        const url = `/api/text${expectedFile ? '?file=' + encodeURIComponent(expectedFile) : ''}`;
+        const res = await fetch(url, { cache: 'no-store', signal });
         if (!res.ok) return;
         const data = await res.json();
+        if (epoch !== fileSwitchEpoch) return;
+        if (currentMeta && data.file && data.file !== currentMeta.file) return;
         populateTextLayers(data);
       } catch (e) {
-        console.error(e);
+        if (e?.name !== 'AbortError') console.error(e);
       }
     }
 
-    function buildPages(meta, preserveScroll = false) {
+    function buildPages(meta, preserveScroll = false, epoch = fileSwitchEpoch) {
       const prevScrollTop = viewer.scrollTop;
       const prevScrollLeft = viewer.scrollLeft;
       const prevScrollRatio = viewer.scrollHeight > 0 ? prevScrollTop / viewer.scrollHeight : 0;
@@ -2788,7 +3291,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
 
       renderPdfOverlays();
-      loadTextLayer();
+      loadTextLayer(meta.file, epoch);
 
       if (preserveScroll) {
         requestAnimationFrame(() => {
@@ -2819,12 +3322,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
       filterTodoBtn.classList.toggle('active', zhFilterMode === 'todo');
       filterPageBtn.textContent = `仅当前页 (P${currentPage})`;
       autoSyncBtn.classList.toggle('active', autoFollow);
+      lastRenderedFilterPage = zhFilterMode === 'page' ? currentPage : null;
       renderLockControls();
+
+      const zhTitleEl = zhPane.querySelector('.zh-title');
+      if (zhTitleEl) {
+        zhTitleEl.title = (currentZh && currentZh.available && currentZh.title_zh) ? currentZh.title_zh : '';
+      }
 
       if (!currentZh || !currentZh.available) {
         zhCountPill.textContent = '无';
-        zhUpdatedAt.textContent = '未挂载对照';
-        zhList.innerHTML = `<div class="zh-empty">${currentZh?.note || '当前 PDF 暂无中文对照 JSON。'}</div>`;
+        zhUpdatedAt.textContent = currentZh?.error ? 'JSON 异常' : '未挂载对照';
+        zhList.textContent = '';
+        const emptyDiv = document.createElement('div');
+        emptyDiv.className = 'zh-empty';
+        if (currentZh?.error) {
+          emptyDiv.textContent = `中文对照 JSON 解析失败：${currentZh.error}`;
+        } else {
+          emptyDiv.textContent = currentZh?.note || '当前 PDF 暂无中文对照 JSON。';
+        }
+        zhList.appendChild(emptyDiv);
         return;
       }
 
@@ -2832,7 +3349,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const q = zhFilterInput.value.trim().toLowerCase();
       const allItems = currentZh.items || [];
       const filtered = allItems.filter(item => {
-        if (zhFilterMode === 'page' && Number(item.page) !== currentPage) return false;
+        if (zhFilterMode === 'page' && !itemMatchesPage(item, currentPage)) return false;
         if (zhFilterMode === 'locked' && !lockedSet.has(item.id)) return false;
         if (zhFilterMode === 'todo' && !item.is_todo) return false;
         if (q) {
@@ -2844,7 +3361,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       zhCountPill.textContent = `${filtered.length}/${allItems.length} 段`;
       if (!filtered.length) {
-        zhList.innerHTML = `<div class="zh-empty">当前筛选条件下无匹配段落。</div>`;
+        zhList.textContent = '';
+        const emptyDiv = document.createElement('div');
+        emptyDiv.className = 'zh-empty';
+        emptyDiv.textContent = '当前筛选条件下无匹配段落。';
+        zhList.appendChild(emptyDiv);
         return;
       }
 
@@ -2855,7 +3376,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         card.className = 'zh-card';
         card.dataset.id = item.id;
         card.dataset.page = String(item.page);
-        if (Number(item.page) === currentPage) card.classList.add('is-current-page');
+        if (itemMatchesPage(item, currentPage)) card.classList.add('is-current-page');
         if (item.id === selectedZhId) card.classList.add('is-selected');
         if (item.is_todo) card.classList.add('is-todo');
         if (isLocked) card.classList.add('is-locked');
@@ -2956,7 +3477,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 }
                 e.stopPropagation();
                 selectedZhId = item.id;
-                suppressNextAutoFollow = true;
+                suppressAutoFollowBriefly(700);
                 const isSameSingle = activeSent
                   && activeSent.itemId === item.id
                   && activeSent.zhIndices.length === 1
@@ -2971,7 +3492,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 }
                 highlightZhCards(false);
                 updateZhSentenceClasses();
-                setTimeout(() => { suppressNextAutoFollow = false; }, 700);
               });
               body.appendChild(sp);
             }
@@ -2992,12 +3512,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
           }
           selectedZhId = item.id;
           activeSent = null;
-          suppressNextAutoFollow = true;
+          suppressAutoFollowBriefly(700);
           jumpToPdfItem(item.id, item.page);
           flashPdfBlock(item.id);
           highlightZhCards(false);
           updateZhSentenceClasses();
-          setTimeout(() => { suppressNextAutoFollow = false; }, 700);
         };
 
         frag.appendChild(card);
@@ -3049,12 +3568,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
       renderPdfActiveOverlays();
 
       if (commitDomAndScroll) {
-        suppressNextAutoFollow = true;
+        suppressAutoFollowBriefly(700);
         highlightZhCards(false);
         updateZhSentenceClasses();
         const rects = getEnRectsFor(targetItemId, enIndices);
         jumpToPdfRects(rects, targetItemId, it.page);
-        setTimeout(() => { suppressNextAutoFollow = false; }, 700);
       }
       return true;
     }
@@ -3078,13 +3596,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     function highlightZhCards(scrollToActive = false) {
       filterPageBtn.textContent = `仅当前页 (P${currentPage})`;
-      if (zhFilterMode === 'page') {
+      if (zhFilterMode === 'page' && lastRenderedFilterPage !== currentPage) {
         renderZhPane(false);
         return;
       }
       let firstForPage = null;
       zhList.querySelectorAll('.zh-card').forEach(card => {
-        const isPg = Number(card.dataset.page) === currentPage;
+        const it = itemById[card.dataset.id];
+        const isPg = it ? itemMatchesPage(it, currentPage) : (Number(card.dataset.page) === currentPage);
         card.classList.toggle('is-current-page', isPg);
         card.classList.toggle('is-selected', card.dataset.id === selectedZhId);
         if (isPg && !firstForPage) firstForPage = card;
@@ -3099,11 +3618,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
 
     async function loadMeta(preserveScroll = false, isAuto = false) {
+      if (isAuto && (metaInFlight || document.hidden)) return;
+      const epoch = fileSwitchEpoch;
+      const reqFile = currentFile;
+      if (!isAuto && metaAbortCtrl) metaAbortCtrl.abort();
+      const ctrl = new AbortController();
+      metaAbortCtrl = ctrl;
+      metaInFlight = true;
       try {
-        const url = `/api/meta${currentFile ? '?file=' + encodeURIComponent(currentFile) : ''}`;
-        const res = await fetch(url, { cache: 'no-store' });
+        const url = `/api/meta${reqFile ? '?file=' + encodeURIComponent(reqFile) : ''}`;
+        const res = await fetch(url, { cache: 'no-store', signal: ctrl.signal });
         if (!res.ok) return;
         const meta = await res.json();
+        if (epoch !== fileSwitchEpoch) return;
+        if (reqFile && meta.file !== reqFile && currentFile === reqFile) {
+          // Server fell back to default file when requested file no longer exists
+          currentFile = meta.file;
+        }
+        const filesChanged = !currentMeta || JSON.stringify(currentMeta.files || []) !== JSON.stringify(meta.files || []);
         const changed = !currentMeta || currentMeta.file !== meta.file || currentMeta.mtime !== meta.mtime;
         if (changed) {
           liveDot.classList.add('updating');
@@ -3113,27 +3645,42 @@ HTML_PAGE = r"""<!DOCTYPE html>
           pageCountEl.textContent = meta.page_count;
           pageInput.max = meta.page_count;
           updatedAt.textContent = meta.mtime_str;
-          buildPages(meta, preserveScroll);
+          buildPages(meta, preserveScroll, epoch);
           if (isAuto) showToast(`已自动刷新 ${meta.file} (${meta.mtime_str})`);
           setTimeout(() => liveDot.classList.remove('updating'), 400);
+        } else if (filesChanged) {
+          currentMeta.files = meta.files;
+          syncFileDropdown(meta);
         }
       } catch (e) {
-        console.error(e);
+        if (e?.name !== 'AbortError') console.error(e);
+      } finally {
+        if (metaAbortCtrl === ctrl) metaInFlight = false;
       }
     }
 
     async function loadZh(isAuto = false) {
+      if (isAuto && (zhInFlight || document.hidden)) return;
+      const epoch = fileSwitchEpoch;
+      const reqFile = currentFile;
+      if (!isAuto && zhAbortCtrl) zhAbortCtrl.abort();
+      const ctrl = new AbortController();
+      zhAbortCtrl = ctrl;
+      zhInFlight = true;
       try {
-        const url = `/api/zh${currentFile ? '?file=' + encodeURIComponent(currentFile) : ''}`;
-        const res = await fetch(url, { cache: 'no-store' });
+        const url = `/api/zh${reqFile ? '?file=' + encodeURIComponent(reqFile) : ''}`;
+        const res = await fetch(url, { cache: 'no-store', signal: ctrl.signal });
         if (!res.ok) return;
         const zh = await res.json();
+        if (epoch !== fileSwitchEpoch) return;
         const changed = !currentZh
           || currentZh.mtime !== zh.mtime
           || currentZh.pdf_mtime !== zh.pdf_mtime
           || currentZh.locks_mtime !== zh.locks_mtime
           || currentZh.available !== zh.available
-          || currentZh.file !== zh.file;
+          || currentZh.file !== zh.file
+          || currentZh.error !== zh.error
+          || currentZh.note !== zh.note;
         if (changed) {
           const textUpdated = currentZh && currentZh.mtime !== zh.mtime;
           currentZh = zh;
@@ -3143,7 +3690,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
           if (isAuto && textUpdated && zh.available) showToast(`已同步更新中文对照 (${zh.mtime_str})`);
         }
       } catch (e) {
-        console.error(e);
+        if (e?.name !== 'AbortError') console.error(e);
+      } finally {
+        if (zhAbortCtrl === ctrl) zhInFlight = false;
       }
     }
 
@@ -3180,22 +3729,38 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const q = searchInput.value.trim();
       if (!q) {
         searchDrawer.classList.remove('open');
-        searchDrawer.innerHTML = '';
+        searchDrawer.textContent = '';
         return;
       }
       const res = await fetch(`/api/search?file=${encodeURIComponent(currentFile)}&q=${encodeURIComponent(q)}`);
+      if (!res.ok) return;
       const data = await res.json();
       searchDrawer.classList.add('open');
-      if (!data.matches.length) {
-        searchDrawer.innerHTML = `<div class="muted" style="padding:8px;">未找到 "${q}"</div>`;
+      searchDrawer.textContent = '';
+      if (!data.matches || !data.matches.length) {
+        const empty = document.createElement('div');
+        empty.className = 'muted';
+        empty.style.padding = '8px';
+        empty.textContent = `未找到 "${q}"`;
+        searchDrawer.appendChild(empty);
         return;
       }
-      searchDrawer.innerHTML = `<div class="muted" style="margin-bottom:6px;">共 ${data.matches.length} 页匹配</div>`;
+      const hdr = document.createElement('div');
+      hdr.className = 'muted';
+      hdr.style.marginBottom = '6px';
+      hdr.textContent = `共 ${data.matches.length} 页匹配`;
+      searchDrawer.appendChild(hdr);
       data.matches.forEach(m => {
         const div = document.createElement('div');
         div.className = 'search-item';
-        div.innerHTML = `<div class="pg">第 ${m.page} 页 (${m.count} 处)</div><div class="snip"></div>`;
-        div.querySelector('.snip').textContent = m.snippet;
+        const pgEl = document.createElement('div');
+        pgEl.className = 'pg';
+        pgEl.textContent = `第 ${m.page} 页 (${m.count} 处)`;
+        const snipEl = document.createElement('div');
+        snipEl.className = 'snip';
+        snipEl.textContent = m.snippet;
+        div.appendChild(pgEl);
+        div.appendChild(snipEl);
         div.onclick = () => jumpToPage(m.page);
         searchDrawer.appendChild(div);
       });
@@ -3233,10 +3798,23 @@ HTML_PAGE = r"""<!DOCTYPE html>
     });
 
     fileSelect.addEventListener('change', () => {
+      fileSwitchEpoch += 1;
+      if (metaAbortCtrl) metaAbortCtrl.abort();
+      if (zhAbortCtrl) zhAbortCtrl.abort();
+      if (textAbortCtrl) textAbortCtrl.abort();
       currentFile = fileSelect.value;
       currentMeta = null;
       currentZh = null;
+      currentPage = 1;
       selectedZhId = null;
+      activeSent = null;
+      hoverSent = null;
+      hoveredPdfLink = null;
+      hoveredItemId = null;
+      hoveredPage = null;
+      jumpHistory = [];
+      updateBackJumpBtn();
+      hoverPill.style.display = 'none';
       loadMeta(false, false);
       loadZh(false);
     });
@@ -3274,6 +3852,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
       viewer.classList.toggle('force-pan', active);
       if (panModeBtn) panModeBtn.classList.toggle('active', panMode);
     }
+    function isInteractiveTarget(el) {
+      if (!el) return false;
+      const tag = el.tagName;
+      return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'BUTTON' || tag === 'A' || !!el.isContentEditable;
+    }
     if (panModeBtn) {
       panModeBtn.onclick = () => {
         panMode = !panMode;
@@ -3282,9 +3865,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       };
     }
     window.addEventListener('keydown', (e) => {
-      if (e.code === 'Space' && document.activeElement?.tagName !== 'INPUT') {
-        spaceHeld = true;
-        updatePanCursorMode();
+      if (e.code === 'Space' && !isInteractiveTarget(document.activeElement)) {
+        e.preventDefault();
+        if (!spaceHeld) {
+          spaceHeld = true;
+          updatePanCursorMode();
+        }
       }
       if (e.altKey && e.key === 'ArrowLeft') {
         e.preventDefault();
@@ -3296,6 +3882,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
         spaceHeld = false;
         updatePanCursorMode();
       }
+    });
+    window.addEventListener('blur', () => {
+      spaceHeld = false;
+      isMouseDownInZh = false;
+      isDragging = false;
+      panState = null;
+      viewer.classList.remove('panning');
+      splitter.classList.remove('dragging');
+      document.body.style.userSelect = '';
+      updatePanCursorMode();
     });
 
     viewer.addEventListener('mousedown', (e) => {
@@ -3346,23 +3942,35 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (viewer.contains(range.commonAncestorContainer)) {
           suppressNextPdfClick = true;
           setTimeout(() => { suppressNextPdfClick = false; }, 180);
-          let hitCard = null;
           const hitSpans = [];
           viewer.querySelectorAll('.pdf-tl-span').forEach(sp => {
             try {
               if (range.intersectsNode(sp)) {
-                if (!hitCard) hitCard = sp.closest('.page-card');
                 hitSpans.push(sp);
               }
             } catch (_) {}
           });
-          if (hitCard && hitSpans.length) {
-            const pg = Number(hitCard.dataset.page);
+          if (hitSpans.length) {
             const zhSet = new Set();
             const enSet = new Set();
             let targetItem = null;
             hitSpans.forEach(sp => {
-              const sh = hitTestSentence(pg, Number(sp.dataset.nx), Number(sp.dataset.ny));
+              const spCard = sp.closest('.page-card');
+              const pg = spCard ? Number(spCard.dataset.page) : currentPage;
+              const x0 = Number(sp.dataset.x0);
+              const x1 = Number(sp.dataset.x1);
+              let nx = Number(sp.dataset.nx);
+              const ny = Number(sp.dataset.ny);
+              const txtLen = (sp.textContent || '').length;
+              if (Number.isFinite(x0) && Number.isFinite(x1) && x1 > x0 && txtLen > 0) {
+                let sOff = 0;
+                let eOff = txtLen;
+                const tn = sp.firstChild;
+                if (tn && range.startContainer === tn) sOff = Math.max(0, Math.min(txtLen, range.startOffset));
+                if (tn && range.endContainer === tn) eOff = Math.max(sOff, Math.min(txtLen, range.endOffset));
+                nx = x0 + (((sOff + eOff) / 2) / txtLen) * (x1 - x0);
+              }
+              const sh = hitTestSentence(pg, nx, ny);
               if (sh) {
                 if (!targetItem) targetItem = sh.itemId;
                 if (sh.itemId === targetItem) {
@@ -3378,13 +3986,42 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 zhIndices: Array.from(zhSet).sort((a, b) => a - b),
                 enIndices: Array.from(enSet).sort((a, b) => a - b),
               };
+              const targetObj = itemById[targetItem];
+              if (!zhVisible) {
+                zhVisible = true;
+                applyLayoutState();
+              }
+              let needRerender = false;
+              if (zhFilterInput.value.trim()) {
+                zhFilterInput.value = '';
+                needRerender = true;
+              }
+              if (targetObj && zhFilterMode === 'todo' && !targetObj.is_todo) {
+                zhFilterMode = 'all';
+                localStorage.setItem('paper_zh_filter', 'all');
+                needRerender = true;
+              } else if (targetObj && zhFilterMode === 'locked' && !lockedSet.has(targetObj.id)) {
+                zhFilterMode = 'all';
+                localStorage.setItem('paper_zh_filter', 'all');
+                needRerender = true;
+              } else if (targetObj && zhFilterMode === 'page' && !itemMatchesPage(targetObj, currentPage)) {
+                zhFilterMode = 'all';
+                localStorage.setItem('paper_zh_filter', 'all');
+                needRerender = true;
+              }
+              if (needRerender) {
+                renderZhPane(false);
+              } else {
+                highlightZhCards(false);
+              }
               renderPdfActiveOverlays();
-              highlightZhCards(false);
               updateZhSentenceClasses();
-              const targetSpan = zhList.querySelector(
-                `.zh-card[data-id="${CSS.escape(targetItem)}"] .zh-sent[data-sidx="${activeSent.zhIndices[0]}"]`
-              );
-              if (targetSpan) targetSpan.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              if (activeSent.zhIndices.length > 0) {
+                const targetSpan = zhList.querySelector(
+                  `.zh-card[data-id="${CSS.escape(targetItem)}"] .zh-sent[data-sidx="${activeSent.zhIndices[0]}"]`
+                );
+                if (targetSpan) targetSpan.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              }
             }
           }
         }
@@ -3442,6 +4079,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     };
     zhFilterInput.addEventListener('input', () => renderZhPane(false));
     document.getElementById('reloadBtn').onclick = () => {
+      fileSwitchEpoch += 1;
       currentMeta = null;
       currentZh = null;
       loadMeta(true, false);
@@ -3456,13 +4094,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
     viewer.addEventListener('scroll', updateCurrentPageOnScroll, { passive: true });
     window.addEventListener('resize', () => { if (zoomMode === 'fit') applyZoom(); });
 
+    function scheduleNextPoll() {
+      if (pollTimer) clearTimeout(pollTimer);
+      pollTimer = setTimeout(async () => {
+        if (!document.hidden) {
+          await Promise.all([loadMeta(true, true), loadZh(true)]);
+        }
+        scheduleNextPoll();
+      }, 1500);
+    }
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) {
+        loadMeta(true, true);
+        loadZh(true);
+      }
+    });
+
     applyLayoutState();
-    loadMeta(false, false);
-    loadZh(false);
-    setInterval(() => {
-      loadMeta(true, true);
-      loadZh(true);
-    }, 1500);
+    Promise.all([loadMeta(false, false), loadZh(false)]).finally(scheduleNextPoll);
   </script>
 </body>
 </html>
@@ -3470,37 +4119,104 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 
 class ViewerHandler(http.server.BaseHTTPRequestHandler):
+    timeout = 15
+
     def log_message(self, format, *args):
         pass
 
-    def _send(self, code: int, body: bytes, content_type: str):
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+    def _allowed_hosts(self) -> set[str]:
+        port = self.server.server_address[1]
+        hosts = {f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"}
+        if port == 80:
+            hosts.update({"127.0.0.1", "localhost", "[::1]"})
+        return hosts
+
+    def _allowed_origins(self) -> set[str]:
+        port = self.server.server_address[1]
+        origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}", f"http://[::1]:{port}"}
+        if port == 80:
+            origins.update({"http://127.0.0.1", "http://localhost", "http://[::1]"})
+        return origins
+
+    def _is_valid_host(self) -> bool:
+        host = (self.headers.get("Host") or "").strip().lower()
+        return host in self._allowed_hosts()
+
+    def _is_valid_origin_or_referer(self) -> bool:
+        allowed = self._allowed_origins()
+        origin = (self.headers.get("Origin") or "").strip()
+        if origin:
+            return origin.lower() in allowed
+        referer = (self.headers.get("Referer") or "").strip()
+        if referer:
+            p = urllib.parse.urlparse(referer)
+            return f"{p.scheme}://{p.netloc}".lower() in allowed
+        return True
+
+    def _send(self, code: int, body: bytes, content_type: str, extra_headers: dict[str, str] | None = None):
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "SAMEORIGIN")
+            self.send_header("Referrer-Policy", "no-referrer")
+            if extra_headers:
+                for hk, hv in extra_headers.items():
+                    self.send_header(hk, hv)
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+
+    def _send_json(self, code: int, payload: Any):
+        self._send(code, json.dumps(payload, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+
+    def _render_html_page(self) -> tuple[bytes, dict[str, str]]:
+        nonce = secrets.token_urlsafe(16)
+        html = (
+            HTML_PAGE
+            .replace("__CSP_NONCE__", nonce)
+            .replace("__VIEWER_SESSION_TOKEN__", json.dumps(SESSION_TOKEN))
+        )
+        csp = (
+            f"default-src 'self'; "
+            f"script-src 'nonce-{nonce}'; "
+            f"style-src 'self' 'unsafe-inline'; "
+            f"img-src 'self' data:; "
+            f"connect-src 'self'; "
+            f"object-src 'none'; "
+            f"base-uri 'none'; "
+            f"frame-ancestors 'self'"
+        )
+        return html.encode("utf-8"), {"Content-Security-Policy": csp}
 
     def do_GET(self):
+        if not self._is_valid_host():
+            self._send(403, b"Forbidden: invalid Host header", "text/plain; charset=utf-8")
+            return
+
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
         file_param = qs.get("file", [None])[0]
 
         try:
             if parsed.path in ("/", "/index.html"):
-                self._send(200, HTML_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+                body, headers = self._render_html_page()
+                self._send(200, body, "text/html; charset=utf-8", extra_headers=headers)
             elif parsed.path == "/api/meta":
                 data = get_meta(file_param)
-                self._send(200, json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+                self._send_json(200, data)
             elif parsed.path == "/api/text":
                 data = get_text_layer(file_param)
-                self._send(200, json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+                self._send_json(200, data)
             elif parsed.path == "/api/zh":
                 data = get_zh_companion(file_param)
-                self._send(200, json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+                self._send_json(200, data)
             elif parsed.path == "/api/locks":
                 pdf_path = resolve_pdf(file_param)
-                ldata = paper_lock.load_locks(pdf_path)
+                ldata = _call_load_locks(pdf_path)
                 lp = paper_lock.lock_path_for(pdf_path)
                 out = {
                     "file": pdf_path.name,
@@ -3510,94 +4226,222 @@ class ViewerHandler(http.server.BaseHTTPRequestHandler):
                     "locks": ldata.get("locks") or {},
                     "locks_mtime": lp.stat().st_mtime if lp.exists() else 0.0,
                 }
-                self._send(200, json.dumps(out, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+                self._send_json(200, out)
             elif parsed.path == "/api/search":
                 q = qs.get("q", [""])[0]
                 matches = search_pdf(file_param, q)
-                self._send(200, json.dumps({"matches": matches}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+                self._send_json(200, {"matches": matches})
             elif parsed.path.startswith("/api/page/") and parsed.path.endswith(".svg"):
                 idx_str = parsed.path[len("/api/page/"):-len(".svg")]
-                svg_bytes, _ = render_page_svg(file_param, int(idx_str))
+                try:
+                    page_idx = int(idx_str)
+                except ValueError:
+                    raise ValueError("Invalid page index")
+                svg_bytes, _ = render_page_svg(file_param, page_idx)
                 self._send(200, svg_bytes, "image/svg+xml; charset=utf-8")
             elif parsed.path.startswith("/api/page/") and parsed.path.endswith(".png"):
                 idx_str = parsed.path[len("/api/page/"):-len(".png")]
-                png_bytes, _ = render_page_png(file_param, int(idx_str))
+                try:
+                    page_idx = int(idx_str)
+                except ValueError:
+                    raise ValueError("Invalid page index")
+                png_bytes, _ = render_page_png(file_param, page_idx)
                 self._send(200, png_bytes, "image/png")
             else:
-                self._send(404, b"Not Found", "text/plain")
-        except Exception as e:
-            self._send(500, str(e).encode("utf-8"), "text/plain; charset=utf-8")
+                self._send(404, b"Not Found", "text/plain; charset=utf-8")
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+        except ValueError as e:
+            self._send(400, str(e).encode("utf-8"), "text/plain; charset=utf-8")
+        except (FileNotFoundError, IndexError) as e:
+            self._send(404, str(e).encode("utf-8"), "text/plain; charset=utf-8")
+        except Exception:
+            self._send(500, b"Internal Server Error", "text/plain; charset=utf-8")
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
-        try:
-            if parsed.path != "/api/locks":
-                self._send(404, b"Not Found", "text/plain")
+        if parsed.path != "/api/locks":
+            self._send(404, b"Not Found", "text/plain; charset=utf-8")
+            return
+
+        if not self._is_valid_host():
+            self._send_json(403, {"error": "Forbidden: invalid Host header"})
+            return
+        if not self._is_valid_origin_or_referer():
+            self._send_json(403, {"error": "Forbidden: cross-origin request rejected"})
+            return
+
+        content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            self._send_json(415, {"error": "Unsupported Media Type: expected application/json"})
+            return
+
+        token_hdr = (self.headers.get("X-Viewer-Token") or "").strip()
+        if not token_hdr or not secrets.compare_digest(token_hdr, SESSION_TOKEN):
+            self._send_json(403, {"error": "Forbidden: missing or invalid X-Viewer-Token"})
+            return
+
+        raw_len = self.headers.get("Content-Length")
+        if raw_len is None:
+            length = 0
+        else:
+            try:
+                length = int(raw_len.strip())
+            except ValueError:
+                self._send_json(400, {"error": "Invalid Content-Length header"})
                 return
-            length = int(self.headers.get("Content-Length", "0") or "0")
+        if length < 0:
+            self._send_json(400, {"error": "Invalid negative Content-Length"})
+            return
+        if length > MAX_POST_BODY_BYTES:
+            self._send_json(413, {"error": f"Payload Too Large (limit {MAX_POST_BODY_BYTES} bytes)"})
+            return
+
+        try:
             body = self.rfile.read(length) if length > 0 else b"{}"
-            payload = json.loads(body.decode("utf-8"))
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                self._send_json(400, {"error": f"Invalid JSON body: {exc}"})
+                return
+
+            if not isinstance(payload, dict):
+                self._send_json(400, {"error": "JSON payload must be an object"})
+                return
+
             file_param = payload.get("file")
-            action = str(payload.get("action") or "toggle")
-            ids = payload.get("ids") or []
+            if file_param is not None and not isinstance(file_param, str):
+                self._send_json(400, {"error": "'file' must be a string"})
+                return
+
+            action = payload.get("action")
+            if action not in ("lock", "unlock", "toggle", "set_mode"):
+                self._send_json(400, {"error": "Invalid 'action': must be one of lock, unlock, toggle, set_mode"})
+                return
+
             mode = payload.get("mode")
+            if action == "set_mode":
+                if mode not in ("deny", "force_ask"):
+                    self._send_json(400, {"error": "Invalid 'mode': must be 'deny' or 'force_ask'"})
+                    return
+                ids: list[str] = []
+            else:
+                raw_ids = payload.get("ids", [])
+                if not isinstance(raw_ids, list) or not all(isinstance(x, str) and x.strip() for x in raw_ids):
+                    self._send_json(400, {"error": "'ids' must be a list of non-empty strings"})
+                    return
+                ids = [x.strip() for x in raw_ids]
+                if mode is not None and mode not in ("deny", "force_ask"):
+                    self._send_json(400, {"error": "Invalid 'mode': must be 'deny' or 'force_ask'"})
+                    return
 
             pdf_path = resolve_pdf(file_param)
             zh_path = resolve_zh_path(pdf_path)
-            items = []
-            if zh_path and zh_path.exists():
-                items = json.loads(zh_path.read_text(encoding="utf-8")).get("items", [])
+            items: list[dict] = []
+            tex_path: Path | None = None
+            if zh_path is not None and zh_path.is_file():
+                raw_zh, zh_err = _load_zh_json(zh_path)
+                if zh_err is not None or raw_zh is None:
+                    if action in ("lock", "toggle"):
+                        self._send_json(400, {"error": f"Companion JSON error: {zh_err}"})
+                        return
+                else:
+                    target_file = _safe_str(raw_zh.get("file") or pdf_path.name).strip()
+                    if target_file and target_file != pdf_path.name:
+                        if action in ("lock", "toggle"):
+                            self._send_json(400, {"error": f"Companion JSON belongs to {target_file}, not {pdf_path.name}"})
+                            return
+                    else:
+                        items, _ = _sanitize_zh_items(raw_zh.get("items", []))
+                        tex_path = _call_tex_path_for(pdf_path, tex_hint=raw_zh.get("tex"), base_dir=zh_path.parent)
 
-            ldata = paper_lock.update_locks_for_pdf(pdf_path, items, action=action, ids=ids, mode=mode)
+            ldata = _call_update_locks_for_pdf(pdf_path, items, action=action, ids=ids, mode=mode, tex_path=tex_path)
             lp = paper_lock.lock_path_for(pdf_path)
             out = {
                 "ok": True,
                 "file": pdf_path.name,
-                "tex": ldata.get("tex", pdf_path.with_suffix(".tex").name),
+                "tex": ldata.get("tex", (tex_path or pdf_path.with_suffix(".tex")).name),
                 "mode": ldata.get("mode", "deny"),
                 "locked_ids": sorted((ldata.get("locks") or {}).keys()),
                 "locks_mtime": lp.stat().st_mtime if lp.exists() else 0.0,
+                "unmatched": ldata.get("unmatched") or [],
+                "warnings": ldata.get("warnings") or [],
             }
-            self._send(200, json.dumps(out, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
-        except Exception as e:
-            self._send(500, json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            self._send_json(200, out)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+        except ValueError as e:
+            self._send_json(400, {"error": str(e)})
+        except FileNotFoundError as e:
+            self._send_json(404, {"error": str(e)})
+        except Exception:
+            self._send_json(500, {"error": "Internal server error while updating locks"})
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Live Bilingual Vector-SVG PDF Paper Viewer")
     parser.add_argument("--pdf", type=str, default=None, help="Path to target PDF file (e.g. paper/main.pdf)")
     parser.add_argument("--paper-dir", type=str, default=None, help="Directory containing PDF files (if --pdf is not given)")
     parser.add_argument("--default", type=str, default=None, help="Default PDF filename inside --paper-dir")
     parser.add_argument("--zh", type=str, default=None, help="Optional path to Chinese companion JSON")
-    parser.add_argument("--port", type=int, default=8788, help="Local HTTP port (default: 8788)")
-    return parser.parse_args()
+    parser.add_argument("--port", type=int, default=8788, help="Local HTTP port (0-65535, default: 8788)")
+    return parser.parse_args(argv)
 
 
-def main():
-    global PAPER_DIR, DEFAULT_FILE, EXPLICIT_ZH_PATH, PORT
-    args = parse_args()
+def main(argv: list[str] | None = None):
+    global PAPER_DIR, DEFAULT_FILE, EXPLICIT_ZH_PATH, PORT, SESSION_TOKEN
+    args = parse_args(argv)
+    if args.port < 0 or args.port > 65535:
+        raise SystemExit(f"Invalid --port {args.port}: must be between 0 and 65535")
     PORT = args.port
+    EXPLICIT_ZH_PATH = None
 
     if args.pdf:
         pdf_path = Path(args.pdf).resolve()
-        if not pdf_path.exists():
-            raise SystemExit(f"PDF not found: {pdf_path}")
+        if not pdf_path.exists() or not pdf_path.is_file():
+            raise SystemExit(f"PDF file not found: {pdf_path}")
+        if pdf_path.suffix.lower() != ".pdf":
+            raise SystemExit(f"Not a PDF file: {pdf_path}")
         PAPER_DIR = pdf_path.parent
         DEFAULT_FILE = pdf_path.name
     elif args.paper_dir:
-        PAPER_DIR = Path(args.paper_dir).resolve()
-        DEFAULT_FILE = args.default or ""
+        paper_dir = Path(args.paper_dir).resolve()
+        if not paper_dir.exists() or not paper_dir.is_dir():
+            raise SystemExit(f"Paper directory not found: {paper_dir}")
+        PAPER_DIR = paper_dir
+        default_name = (args.default or "").strip()
+        if default_name:
+            if "/" in default_name or "\\" in default_name or ".." in default_name:
+                raise SystemExit(f"Invalid --default filename: {default_name}")
+            if not (PAPER_DIR / default_name).is_file():
+                print(f"[paper_viewer] Warning: default PDF '{default_name}' not found in {PAPER_DIR}", file=sys.stderr, flush=True)
+        DEFAULT_FILE = default_name
     else:
         raise SystemExit("Please pass --pdf <path/to/main.pdf> or --paper-dir <path/to/dir>")
 
     if args.zh:
-        EXPLICIT_ZH_PATH = Path(args.zh).resolve()
+        zh_path = Path(args.zh).resolve()
+        if not zh_path.exists() or not zh_path.is_file():
+            raise SystemExit(f"Companion JSON file not found: {zh_path}")
+        EXPLICIT_ZH_PATH = zh_path
 
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), ViewerHandler)
-    print(f"[paper_viewer] Serving {PAPER_DIR / DEFAULT_FILE} at http://127.0.0.1:{PORT}", flush=True)
+    SESSION_TOKEN = secrets.token_urlsafe(32)
+    try:
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), ViewerHandler)
+    except OSError as exc:
+        raise SystemExit(f"Failed to bind 127.0.0.1:{PORT}: {exc}")
+
+    PORT = server.server_address[1]
+    target_display = (PAPER_DIR / DEFAULT_FILE) if DEFAULT_FILE else PAPER_DIR
+    print(f"[paper_viewer] Serving {target_display} at http://127.0.0.1:{PORT}", flush=True)
     if EXPLICIT_ZH_PATH:
         print(f"[paper_viewer] Companion JSON: {EXPLICIT_ZH_PATH}", flush=True)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":
