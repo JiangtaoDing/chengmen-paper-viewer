@@ -1,4 +1,6 @@
-# Bilingual Live Paper Viewer (中英双栏实时矢量论文预览器)
+# Chengmen Paper Viewer (`chengmen-paper-viewer`)
+
+> 中英双栏实时矢量论文预览与协作工作流 · Bilingual Live Vector-SVG Paper Viewer
 
 A lightweight, zero-intrusion **live bilingual preview, navigation, and lock-guarded co-writing toolkit** for writing English LaTeX research papers (ICML / NeurIPS / ICLR / ACL / CVPR / IEEE, single-column or two-column) — built for both human co-authors and AI coding agents.
 
@@ -42,8 +44,10 @@ Render your compiled English `.pdf` on the left as **lossless vector SVG** (with
 
 ## Quick Start / 快速上手
 
-### 1. Install Dependency
+### 1. Clone & Install Dependency
 ```bash
+git clone https://github.com/JiangtaoDing/chengmen-paper-viewer.git
+cd chengmen-paper-viewer
 pip install -r requirements.txt
 # or simply: pip install pymupdf
 ```
