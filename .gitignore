@@ -3,6 +3,7 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+mcp_app/node_modules/
 .DS_Store
 Thumbs.db
 .paper_viewer/

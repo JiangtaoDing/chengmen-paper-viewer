@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-label="Chengmen Paper Viewer">
+  <defs>
+    <linearGradient id="cm-bg" x1="14" y1="14" x2="114" y2="114" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1D4ED8"/>
+      <stop offset="100%" stop-color="#0F172A"/>
+    </linearGradient>
+    <linearGradient id="cm-arch" x1="28" y1="26" x2="100" y2="102" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#818CF8"/>
+    </linearGradient>
+    <linearGradient id="cm-lock" x1="82" y1="74" x2="108" y2="108" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FBBF24"/>
+      <stop offset="100%" stop-color="#F59E0B"/>
+    </linearGradient>
+  </defs>
+  <!-- ~10% empty margin baked in: main badge occupies x=14..114, y=14..114 -->
+  <rect x="14" y="14" width="100" height="100" rx="22" fill="url(#cm-bg)" stroke="#60A5FA" stroke-width="2.5"/>
+  <!-- Stylized Chengmen (city gate) battlements & bilingual split-page arch -->
+  <path d="M28 42 V30 H40 V36 H52 V30 H76 V36 H88 V30 H100 V42" fill="none" stroke="url(#cm-arch)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Left English PDF page -->
+  <rect x="28" y="46" width="33" height="50" rx="5" fill="#F8FAFC" fill-opacity="0.96"/>
+  <rect x="34" y="54" width="21" height="4" rx="2" fill="#1D4ED8"/>
+  <rect x="34" y="63" width="21" height="3" rx="1.5" fill="#64748B"/>
+  <rect x="34" y="70" width="17" height="3" rx="1.5" fill="#64748B"/>
+  <rect x="34" y="77" width="21" height="3" rx="1.5" fill="#38BDF8"/>
+  <rect x="34" y="84" width="15" height="3" rx="1.5" fill="#94A3B8"/>
+  <!-- Right Chinese companion pane -->
+  <rect x="67" y="46" width="33" height="50" rx="5" fill="#E0F2FE" fill-opacity="0.96"/>
+  <rect x="73" y="54" width="21" height="4" rx="2" fill="#0284C7"/>
+  <rect x="73" y="63" width="21" height="3" rx="1.5" fill="#475569"/>
+  <rect x="73" y="70" width="16" height="3" rx="1.5" fill="#475569"/>
+  <rect x="73" y="77" width="19" height="3" rx="1.5" fill="#0EA5E9"/>
+  <!-- Center sync divider -->
+  <line x1="64" y1="48" x2="64" y2="94" stroke="#38BDF8" stroke-width="2" stroke-dasharray="3 3" stroke-linecap="round"/>
+  <!-- Paragraph-lock badge at bottom-right -->
+  <circle cx="96" cy="94" r="16" fill="#0F172A" stroke="#FBBF24" stroke-width="2.5"/>
+  <path d="M90.5 92 V88.5 C90.5 85.4 92.9 83 96 83 C99.1 83 101.5 85.4 101.5 88.5 V92" fill="none" stroke="#FDE68A" stroke-width="2.6" stroke-linecap="round"/>
+  <rect x="88" y="92" width="16" height="11.5" rx="3" fill="url(#cm-lock)"/>
+  <circle cx="96" cy="97.5" r="1.8" fill="#0F172A"/>
+</svg>

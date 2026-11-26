@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import OrderedDict
 import http.server
 import inspect
@@ -490,17 +491,19 @@ def build_regions(
     items: list[dict],
     pdf_cache_ver: tuple[int, int] | None = None,
 ) -> tuple[list[dict], dict[str, dict]]:
+    resolved_pdf = Path(pdf_path).resolve()
+    pdf_key = str(resolved_pdf)
     if pdf_cache_ver is None:
-        st = pdf_path.stat()
+        st = resolved_pdf.stat()
         pdf_cache_ver = (st.st_mtime_ns, st.st_size)
-    key = (pdf_path.name, pdf_cache_ver, zh_mtime)
+    key = (pdf_key, pdf_cache_ver, zh_mtime)
     with _cache_lock:
         cached = _region_cache.get(key)
         if cached is not None:
             return cached
 
-    pdf_bytes, _, snap_ns, snap_size, stable = _read_pdf_snapshot(pdf_path)
-    key = (pdf_path.name, (snap_ns, snap_size), zh_mtime)
+    pdf_bytes, _, snap_ns, snap_size, stable = _read_pdf_snapshot(resolved_pdf)
+    key = (pdf_key, (snap_ns, snap_size), zh_mtime)
 
     with _mupdf_lock:
         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
@@ -875,17 +878,18 @@ def build_regions(
     result = (regions, sentence_map)
     if stable:
         with _cache_lock:
-            _region_cache.evict_where(lambda k: k[0] == pdf_path.name and k != key)
+            _region_cache.evict_where(lambda k: k[0] == pdf_key and k != key)
             _region_cache[key] = result
     return result
 
 
-def list_pdfs() -> list[str]:
+def list_pdfs_in(paper_dir: Path) -> list[Path]:
+    """Return sorted PDF Paths inside paper_dir (case-insensitive, blocking escaping symlinks)."""
     try:
-        root = PAPER_DIR.resolve()
+        root = Path(paper_dir).resolve()
         if not root.exists() or not root.is_dir():
             return []
-        entries = []
+        entries: list[Path] = []
         for p in root.iterdir():
             if not p.is_file() or p.suffix.lower() != ".pdf":
                 continue
@@ -895,10 +899,15 @@ def list_pdfs() -> list[str]:
                 continue
             if root not in rp.parents:
                 continue
-            entries.append(p.name)
+            entries.append(rp)
     except OSError:
         return []
-    return sorted(entries, key=lambda name: (0 if name == DEFAULT_FILE else 1, name.lower()))
+    return sorted(entries, key=lambda p: p.name.lower())
+
+
+def list_pdfs() -> list[str]:
+    names = [p.name for p in list_pdfs_in(PAPER_DIR)]
+    return sorted(names, key=lambda name: (0 if name == DEFAULT_FILE else 1, name.lower()))
 
 
 def resolve_pdf(name: str | None) -> Path:
@@ -935,25 +944,37 @@ def _peek_zh_target_file(zh_path: Path) -> str | None:
     return None
 
 
-def resolve_zh_path(pdf_path: Path) -> Path | None:
-    if EXPLICIT_ZH_PATH is not None and EXPLICIT_ZH_PATH.is_file():
-        if DEFAULT_FILE and pdf_path.name == DEFAULT_FILE:
-            return EXPLICIT_ZH_PATH
-        tf = _peek_zh_target_file(EXPLICIT_ZH_PATH)
-        if tf is not None and tf == pdf_path.name:
-            return EXPLICIT_ZH_PATH
-        if not DEFAULT_FILE and tf is None and len(list_pdfs()) <= 1:
-            return EXPLICIT_ZH_PATH
-    stem = pdf_path.stem
+def resolve_zh_path_for(
+    pdf_path: Path,
+    explicit_zh: Path | None = None,
+    *,
+    default_file: str | None = None,
+) -> Path | None:
+    pdf_p = Path(pdf_path).resolve()
+    if explicit_zh is not None:
+        ez = Path(explicit_zh).resolve()
+        if ez.is_file():
+            if default_file and pdf_p.name == default_file:
+                return ez
+            tf = _peek_zh_target_file(ez)
+            if tf is not None and tf == pdf_p.name:
+                return ez
+            if not default_file and tf is None and len(list_pdfs_in(pdf_p.parent)) <= 1:
+                return ez
+    stem = pdf_p.stem
     candidates = [
-        pdf_path.parent / ".paper_viewer" / f"{stem}_zh.json",
-        pdf_path.parent / f"{stem}_zh.json",
+        pdf_p.parent / ".paper_viewer" / f"{stem}_zh.json",
+        pdf_p.parent / f"{stem}_zh.json",
         Path(__file__).resolve().parent / "companions" / f"{stem}_zh.json",
     ]
     for c in candidates:
         if c.is_file():
-            return c
+            return c.resolve()
     return None
+
+
+def resolve_zh_path(pdf_path: Path) -> Path | None:
+    return resolve_zh_path_for(pdf_path, EXPLICIT_ZH_PATH, default_file=DEFAULT_FILE or None)
 
 
 def _sanitize_zh_items(raw_items: Any) -> tuple[list[dict], list[str]]:
@@ -1021,6 +1042,20 @@ def _call_tex_path_for(pdf_path: Path, tex_hint: str | None = None, base_dir: Pa
     return paper_lock.tex_path_for(pdf_path)
 
 
+def _resolve_tex_metadata(pdf_path: Path, zh_path: Path | None = None, raw_zh: dict | None = None) -> tuple[Path, str, str]:
+    tex_hint = raw_zh.get("tex") if isinstance(raw_zh, dict) else None
+    base_dir = zh_path.parent if zh_path is not None else pdf_path.parent
+    tex_p = _call_tex_path_for(pdf_path, tex_hint=tex_hint, base_dir=base_dir)
+    if tex_p.is_file():
+        rp = tex_p.resolve()
+        try:
+            uri = rp.as_uri()
+        except ValueError:
+            uri = ""
+        return rp, str(rp), uri
+    return tex_p, "", ""
+
+
 def _call_load_locks(pdf_path: Path) -> dict:
     with _locks_io_lock:
         if hasattr(paper_lock, "get_locks_for_pdf"):
@@ -1059,110 +1094,150 @@ def _call_update_locks_for_pdf(
         return paper_lock.update_locks_for_pdf(pdf_path, items, action=action, ids=ids, mode=mode)
 
 
-def get_meta(filename: str | None) -> dict:
-    path = resolve_pdf(filename)
+def get_meta_for(
+    pdf_path: Path,
+    *,
+    paper_dir: Path | None = None,
+    explicit_zh: Path | None = None,
+    default_file: str | None = None,
+) -> dict:
+    path = Path(pdf_path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"PDF not found: {path.name}")
+    pdir = Path(paper_dir).resolve() if paper_dir is not None else path.parent
+    pdf_key = str(path)
     st = path.stat()
-    key = (path.name, st.st_mtime_ns, st.st_size)
+    key = (pdf_key, st.st_mtime_ns, st.st_size)
+
     with _cache_lock:
         cached = _meta_cache.get(key)
+
     if cached is not None:
-        data = dict(cached)
-        data["files"] = list_pdfs()
-        return data
+        base_info = dict(cached)
+    else:
+        pdf_bytes, mtime, snap_ns, snap_size, stable = _read_pdf_snapshot(path)
+        key = (pdf_key, snap_ns, snap_size)
 
-    pdf_bytes, mtime, snap_ns, snap_size, stable = _read_pdf_snapshot(path)
-    key = (path.name, snap_ns, snap_size)
-
-    with _mupdf_lock:
-        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-        try:
-            pages = [{"w": round(float(p.rect.width) or 1.0, 1), "h": round(float(p.rect.height) or 1.0, 1)} for p in doc]
-            toc = [{"level": lvl, "title": title, "page": page} for lvl, title, page in doc.get_toc()]
+        with _mupdf_lock:
+            doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
             try:
-                named_dests = doc.resolve_names() or {}
-            except Exception:
-                named_dests = {}
-            links_per_page: list[list[dict]] = []
-            n_pages = len(doc)
-            for p in doc:
-                pw, ph = float(p.rect.width) or 1.0, float(p.rect.height) or 1.0
-                plinks: list[dict] = []
-                for lnk in p.get_links():
-                    fr = lnk.get("from")
-                    if not fr:
-                        continue
-                    rect_n = [
-                        round(max(0.0, fr.x0 / pw), 4),
-                        round(max(0.0, fr.y0 / ph), 4),
-                        round(min(1.0, fr.x1 / pw), 4),
-                        round(min(1.0, fr.y1 / ph), 4),
-                    ]
-                    kind = lnk.get("kind")
-                    if kind == pymupdf.LINK_URI and lnk.get("uri"):
-                        uri = str(lnk["uri"]).strip()
-                        if uri.lower().startswith(("http://", "https://", "mailto:")):
-                            plinks.append({"r": rect_n, "t": "uri", "u": uri})
-                    elif kind in (pymupdf.LINK_GOTO, pymupdf.LINK_NAMED):
-                        dst_p = lnk.get("page")
-                        to_pt = lnk.get("to")
-                        ndest = str(lnk.get("nameddest") or "")
-                        is_pdf_bottom_up = (kind == pymupdf.LINK_NAMED)
-                        if (dst_p is None or dst_p < 0) and ndest and ndest in named_dests:
-                            resolved = named_dests[ndest]
-                            dst_p = resolved.get("page")
-                            to_pt = resolved.get("to")
-                            is_pdf_bottom_up = True
-                        if isinstance(dst_p, int) and 0 <= dst_p < n_pages:
-                            dpw = float(doc[dst_p].rect.width) or 1.0
-                            dph = float(doc[dst_p].rect.height) or 1.0
-                            tx, ty = 0.0, 0.0
-                            if to_pt is not None:
-                                try:
-                                    raw_x = float(to_pt.x) if hasattr(to_pt, "x") else float(to_pt[0])
-                                    raw_y = float(to_pt.y) if hasattr(to_pt, "y") else float(to_pt[1])
-                                    tx = max(0.0, min(1.0, raw_x / dpw))
-                                    y_top = (dph - raw_y) if is_pdf_bottom_up else raw_y
-                                    ty = max(0.0, min(1.0, y_top / dph))
-                                except Exception:
-                                    tx, ty = 0.0, 0.0
-                            entry = {"r": rect_n, "t": "goto", "p": dst_p + 1, "x": round(tx, 4), "y": round(ty, 4)}
-                            if ndest:
-                                entry["d"] = ndest
-                            plinks.append(entry)
-                links_per_page.append(plinks)
-            info = {
-                "file": path.name,
-                "files": list_pdfs(),
-                "page_count": n_pages,
-                "mtime": mtime,
-                "mtime_str": time.strftime("%H:%M:%S", time.localtime(mtime)),
-                "pages": pages,
-                "toc": toc,
-                "links": links_per_page,
-            }
-        finally:
-            doc.close()
+                pages = [{"w": round(float(p.rect.width) or 1.0, 1), "h": round(float(p.rect.height) or 1.0, 1)} for p in doc]
+                toc = [{"level": lvl, "title": title, "page": page} for lvl, title, page in doc.get_toc()]
+                try:
+                    named_dests = doc.resolve_names() or {}
+                except Exception:
+                    named_dests = {}
+                links_per_page: list[list[dict]] = []
+                n_pages = len(doc)
+                for p in doc:
+                    pw, ph = float(p.rect.width) or 1.0, float(p.rect.height) or 1.0
+                    plinks: list[dict] = []
+                    for lnk in p.get_links():
+                        fr = lnk.get("from")
+                        if not fr:
+                            continue
+                        rect_n = [
+                            round(max(0.0, fr.x0 / pw), 4),
+                            round(max(0.0, fr.y0 / ph), 4),
+                            round(min(1.0, fr.x1 / pw), 4),
+                            round(min(1.0, fr.y1 / ph), 4),
+                        ]
+                        kind = lnk.get("kind")
+                        if kind == pymupdf.LINK_URI and lnk.get("uri"):
+                            uri = str(lnk["uri"]).strip()
+                            if uri.lower().startswith(("http://", "https://", "mailto:")):
+                                plinks.append({"r": rect_n, "t": "uri", "u": uri})
+                        elif kind in (pymupdf.LINK_GOTO, pymupdf.LINK_NAMED):
+                            dst_p = lnk.get("page")
+                            to_pt = lnk.get("to")
+                            ndest = str(lnk.get("nameddest") or "")
+                            is_pdf_bottom_up = (kind == pymupdf.LINK_NAMED)
+                            if (dst_p is None or dst_p < 0) and ndest and ndest in named_dests:
+                                resolved = named_dests[ndest]
+                                dst_p = resolved.get("page")
+                                to_pt = resolved.get("to")
+                                is_pdf_bottom_up = True
+                            if isinstance(dst_p, int) and 0 <= dst_p < n_pages:
+                                dpw = float(doc[dst_p].rect.width) or 1.0
+                                dph = float(doc[dst_p].rect.height) or 1.0
+                                tx, ty = 0.0, 0.0
+                                if to_pt is not None:
+                                    try:
+                                        raw_x = float(to_pt.x) if hasattr(to_pt, "x") else float(to_pt[0])
+                                        raw_y = float(to_pt.y) if hasattr(to_pt, "y") else float(to_pt[1])
+                                        tx = max(0.0, min(1.0, raw_x / dpw))
+                                        y_top = (dph - raw_y) if is_pdf_bottom_up else raw_y
+                                        ty = max(0.0, min(1.0, y_top / dph))
+                                    except Exception:
+                                        tx, ty = 0.0, 0.0
+                                entry = {"r": rect_n, "t": "goto", "p": dst_p + 1, "x": round(tx, 4), "y": round(ty, 4)}
+                                if ndest:
+                                    entry["d"] = ndest
+                                plinks.append(entry)
+                    links_per_page.append(plinks)
+                base_info = {
+                    "file": path.name,
+                    "pdf_path": str(path),
+                    "page_count": n_pages,
+                    "mtime": mtime,
+                    "mtime_str": time.strftime("%H:%M:%S", time.localtime(mtime)),
+                    "pages": pages,
+                    "sizes": pages,
+                    "toc": toc,
+                    "links": links_per_page,
+                }
+            finally:
+                doc.close()
 
-    if stable:
-        with _cache_lock:
-            _meta_cache.evict_where(lambda k: k[0] == path.name and k != key)
-            _page_cache.evict_where(lambda k: k[0] == path.name and (k[1], k[2]) != (snap_ns, snap_size))
-            _text_cache.evict_where(lambda k: k[0] == path.name and k != key)
-            _meta_cache[key] = info
-    return info
+        if stable:
+            with _cache_lock:
+                _meta_cache.evict_where(lambda k: k[0] == pdf_key and k != key)
+                _page_cache.evict_where(lambda k: k[0] == pdf_key and (k[1], k[2]) != (snap_ns, snap_size))
+                _text_cache.evict_where(lambda k: k[0] == pdf_key and k != key)
+                _meta_cache[key] = dict(base_info)
+
+    sibling_names = [p.name for p in list_pdfs_in(pdir)]
+    if default_file:
+        sibling_names.sort(key=lambda name: (0 if name == default_file else 1, name.lower()))
+    elif path.name in sibling_names:
+        sibling_names.sort(key=lambda name: (0 if name == path.name else 1, name.lower()))
+
+    zh_path = resolve_zh_path_for(path, explicit_zh, default_file=default_file)
+    raw_zh = None
+    if zh_path is not None and zh_path.is_file():
+        loaded, err = _load_zh_json(zh_path)
+        if err is None and loaded is not None:
+            tf = _safe_str(loaded.get("file") or path.name).strip()
+            if not tf or tf == path.name:
+                raw_zh = loaded
+    _, tex_path_str, tex_uri = _resolve_tex_metadata(path, zh_path, raw_zh)
+
+    base_info["paper_dir"] = str(pdir)
+    base_info["files"] = sibling_names
+    base_info["tex_path"] = tex_path_str
+    base_info["tex_uri"] = tex_uri
+    return base_info
 
 
-def get_text_layer(filename: str | None) -> dict:
+def get_meta(filename: str | None) -> dict:
     path = resolve_pdf(filename)
+    return get_meta_for(path, paper_dir=PAPER_DIR, explicit_zh=EXPLICIT_ZH_PATH, default_file=DEFAULT_FILE or None)
+
+
+def _get_text_layer_full(pdf_path: Path) -> dict:
+    path = Path(pdf_path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"PDF not found: {path.name}")
+    pdf_key = str(path)
     st = path.stat()
-    key = (path.name, st.st_mtime_ns, st.st_size)
+    key = (pdf_key, st.st_mtime_ns, st.st_size)
     with _cache_lock:
         cached = _text_cache.get(key)
         if cached is not None:
             return cached
 
     pdf_bytes, mtime, snap_ns, snap_size, stable = _read_pdf_snapshot(path)
-    key = (path.name, snap_ns, snap_size)
+    key = (pdf_key, snap_ns, snap_size)
 
     pages_out: list[dict] = []
     with _mupdf_lock:
@@ -1174,7 +1249,6 @@ def get_text_layer(filename: str | None) -> dict:
                 mid = pw / 2.0
 
                 dict_blks = page.get_text("dict").get("blocks", [])
-                # Collect horizontal spans first to estimate body left margin and exclude rotated/vertical text
                 horiz_spans_for_margin: list[tuple[float, str]] = []
                 horiz_lines: list[tuple[int, int, list[tuple[float, float, float, float, str]]]] = []
                 for db in dict_blks:
@@ -1184,7 +1258,6 @@ def get_text_layer(filename: str | None) -> dict:
                     for lno, ln in enumerate(db.get("lines", [])):
                         ldir = ln.get("dir", (1.0, 0.0))
                         dx = float(ldir[0]) if len(ldir) >= 1 else 1.0
-                        # Skip vertical / strongly rotated text (e.g. figure y-axis labels)
                         if abs(dx) < 0.7:
                             continue
                         span_items: list[tuple[float, float, float, float, str]] = []
@@ -1218,7 +1291,6 @@ def get_text_layer(filename: str | None) -> dict:
                         ry0 = min(x[1] for x in grp)
                         rx1 = max(x[2] for x in grp)
                         ry1 = max(x[3] for x in grp)
-                        # Defensive guard against degenerate vertical bounding boxes
                         if (ry1 - ry0) > (rx1 - rx0) * 1.8 and (ry1 - ry0) > 20.0:
                             return
                         parts: list[str] = []
@@ -1285,42 +1357,108 @@ def get_text_layer(filename: str | None) -> dict:
     res = {"file": path.name, "mtime": mtime, "pages": pages_out}
     if stable:
         with _cache_lock:
-            _text_cache.evict_where(lambda k: k[0] == path.name and k != key)
+            _text_cache.evict_where(lambda k: k[0] == pdf_key and k != key)
             _text_cache[key] = res
     return res
 
 
-def get_zh_companion(filename: str | None) -> dict:
-    pdf_path = resolve_pdf(filename)
-    pdf_st = pdf_path.stat()
+def get_text_layer_for(pdf_path: Path, page_idx: int | None = None) -> dict:
+    full = _get_text_layer_full(pdf_path)
+    if page_idx is None:
+        return full
+    idx = int(page_idx)
+    pages = full["pages"]
+    if idx < 0 or idx >= len(pages):
+        raise IndexError("Page out of range")
+    pg = pages[idx]
+    return {
+        "page": idx,
+        "w": pg["w"],
+        "h": pg["h"],
+        "runs": pg["runs"],
+        "file": full["file"],
+        "mtime": full["mtime"],
+    }
+
+
+def get_text_layer(filename: str | None) -> dict:
+    return get_text_layer_for(resolve_pdf(filename), page_idx=None)
+
+
+def get_zh_for(
+    pdf_path: Path,
+    *,
+    explicit_zh: Path | None = None,
+    default_file: str | None = None,
+) -> dict:
+    path = Path(pdf_path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"PDF not found: {path.name}")
+    pdf_st = path.stat()
     pdf_mtime = pdf_st.st_mtime
-    resolved_name = pdf_path.name
-    zh_path = resolve_zh_path(pdf_path)
+    resolved_name = path.name
+    zh_path = resolve_zh_path_for(path, explicit_zh, default_file=default_file)
+
+    lp = paper_lock.lock_path_for(path)
+    locks_mtime = lp.stat().st_mtime if lp.exists() else 0.0
+    ldata = _call_load_locks(path)
+    locks_dict = ldata.get("locks") or {}
+    locked_set = set(locks_dict.keys())
+    lock_mode = ldata.get("mode", "deny")
+    fallback_tex_p, fallback_tex_path, fallback_tex_uri = _resolve_tex_metadata(path, None, None)
+
     if zh_path is None or not zh_path.is_file():
         return {
             "available": False,
             "file": resolved_name,
+            "pdf_path": str(path),
+            "zh_path": "",
+            "tex": fallback_tex_p.name,
+            "tex_path": fallback_tex_path,
+            "tex_uri": fallback_tex_uri,
+            "title_zh": "",
             "mtime": 0,
             "pdf_mtime": pdf_mtime,
-            "locks_mtime": 0.0,
+            "locks_mtime": locks_mtime,
+            "lock_mode": lock_mode,
+            "mode": lock_mode,
+            "locks": locks_dict,
+            "locked_ids": sorted(locked_set),
             "mtime_str": "--:--:--",
-            "note": f"未找到 {pdf_path.stem}_zh.json（可用 --zh 指定路径）",
+            "note": f"未找到 {path.stem}_zh.json（可用 --zh 指定路径）",
+            "error": None,
+            "warnings": [],
             "items": [],
             "regions": [],
+            "sentences": {},
         }
+
     mtime = zh_path.stat().st_mtime
     raw, err = _load_zh_json(zh_path)
     if err is not None or raw is None:
         return {
             "available": False,
             "file": resolved_name,
+            "pdf_path": str(path),
+            "zh_path": str(zh_path),
+            "tex": fallback_tex_p.name,
+            "tex_path": fallback_tex_path,
+            "tex_uri": fallback_tex_uri,
+            "title_zh": "",
             "mtime": mtime,
             "pdf_mtime": pdf_mtime,
-            "locks_mtime": 0.0,
+            "locks_mtime": locks_mtime,
+            "lock_mode": lock_mode,
+            "mode": lock_mode,
+            "locks": locks_dict,
+            "locked_ids": sorted(locked_set),
             "mtime_str": "--:--:--",
+            "note": None,
             "error": err or "Invalid companion JSON",
+            "warnings": [],
             "items": [],
             "regions": [],
+            "sentences": {},
         }
 
     target_file = _safe_str(raw.get("file") or resolved_name).strip()
@@ -1328,28 +1466,37 @@ def get_zh_companion(filename: str | None) -> dict:
         return {
             "available": False,
             "file": resolved_name,
+            "pdf_path": str(path),
+            "zh_path": str(zh_path),
+            "tex": fallback_tex_p.name,
+            "tex_path": fallback_tex_path,
+            "tex_uri": fallback_tex_uri,
+            "title_zh": "",
             "mtime": mtime,
             "pdf_mtime": pdf_mtime,
-            "locks_mtime": 0.0,
+            "locks_mtime": locks_mtime,
+            "lock_mode": lock_mode,
+            "mode": lock_mode,
+            "locks": locks_dict,
+            "locked_ids": sorted(locked_set),
             "mtime_str": time.strftime("%H:%M:%S", time.localtime(mtime)),
             "note": f"当前中文对照对应 {target_file}",
+            "error": None,
+            "warnings": [],
             "items": [],
             "regions": [],
+            "sentences": {},
         }
 
     items, item_warnings = _sanitize_zh_items(raw.get("items", []))
     regions, sentence_map = build_regions(
-        pdf_path,
+        path,
         pdf_mtime,
         mtime,
         items,
         pdf_cache_ver=(pdf_st.st_mtime_ns, pdf_st.st_size),
     )
-    lp = paper_lock.lock_path_for(pdf_path)
-    locks_mtime = lp.stat().st_mtime if lp.exists() else 0.0
-    ldata = _call_load_locks(pdf_path)
-    locked_set = set((ldata.get("locks") or {}).keys())
-    tex_path = _call_tex_path_for(pdf_path, tex_hint=raw.get("tex"), base_dir=zh_path.parent)
+    tex_p, tex_path_str, tex_uri = _resolve_tex_metadata(path, zh_path, raw)
     primary_page: dict[str, int] = {}
     for r in regions:
         primary_page.setdefault(r["id"], r["page"])
@@ -1360,36 +1507,50 @@ def get_zh_companion(filename: str | None) -> dict:
             it["sent_map"] = sentence_map[it["id"]]
         it["section_group"] = paper_lock.section_group_key(it)
         it["locked"] = it["id"] in locked_set
-    out = {
+    return {
         "available": True,
         "file": resolved_name,
-        "tex": tex_path.name,
+        "pdf_path": str(path),
+        "zh_path": str(zh_path),
+        "tex": tex_p.name,
+        "tex_path": tex_path_str,
+        "tex_uri": tex_uri,
         "title_zh": _safe_str(raw.get("title_zh")),
         "mtime": mtime,
         "pdf_mtime": pdf_mtime,
         "locks_mtime": locks_mtime,
-        "lock_mode": ldata.get("mode", "deny"),
+        "lock_mode": lock_mode,
+        "mode": lock_mode,
+        "locks": locks_dict,
         "locked_ids": sorted(locked_set),
         "mtime_str": time.strftime("%H:%M:%S", time.localtime(mtime)),
+        "note": None,
+        "error": None,
+        "warnings": item_warnings,
         "items": items,
         "regions": regions,
+        "sentences": sentence_map,
     }
-    if item_warnings:
-        out["warnings"] = item_warnings
-    return out
 
 
-def render_page_svg(filename: str | None, page_idx: int) -> tuple[bytes, float]:
-    path = resolve_pdf(filename)
+def get_zh_companion(filename: str | None) -> dict:
+    return get_zh_for(resolve_pdf(filename), explicit_zh=EXPLICIT_ZH_PATH, default_file=DEFAULT_FILE or None)
+
+
+def _render_page_svg_bytes(pdf_path: Path, page_idx: int) -> tuple[bytes, float]:
+    path = Path(pdf_path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"PDF not found: {path.name}")
+    pdf_key = str(path)
     st = path.stat()
-    key = (path.name, st.st_mtime_ns, st.st_size, page_idx, "svg")
+    key = (pdf_key, st.st_mtime_ns, st.st_size, page_idx, "svg")
     with _cache_lock:
         cached = _page_cache.get(key)
         if cached is not None:
             return cached, st.st_mtime
 
     pdf_bytes, mtime, snap_ns, snap_size, stable = _read_pdf_snapshot(path)
-    key = (path.name, snap_ns, snap_size, page_idx, "svg")
+    key = (pdf_key, snap_ns, snap_size, page_idx, "svg")
 
     with _mupdf_lock:
         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
@@ -1404,22 +1565,35 @@ def render_page_svg(filename: str | None, page_idx: int) -> tuple[bytes, float]:
 
     if stable:
         with _cache_lock:
-            _page_cache.evict_where(lambda k: k[0] == path.name and (k[1], k[2]) != (snap_ns, snap_size))
+            _page_cache.evict_where(lambda k: k[0] == pdf_key and (k[1], k[2]) != (snap_ns, snap_size))
             _page_cache[key] = svg_bytes
     return svg_bytes, mtime
 
 
-def render_page_png(filename: str | None, page_idx: int) -> tuple[bytes, float]:
-    path = resolve_pdf(filename)
+def render_page_svg_for(pdf_path: Path, page_idx: int) -> str:
+    svg_bytes, _ = _render_page_svg_bytes(pdf_path, int(page_idx))
+    return svg_bytes.decode("utf-8")
+
+
+def render_page_svg(filename: str | None, page_idx: int) -> tuple[bytes, float]:
+    return _render_page_svg_bytes(resolve_pdf(filename), int(page_idx))
+
+
+def _render_page_png_bytes(pdf_path: Path, page_idx: int, scale: float = RENDER_SCALE) -> tuple[bytes, float]:
+    path = Path(pdf_path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"PDF not found: {path.name}")
+    clamped_scale = round(max(0.5, min(5.0, float(scale))), 3)
+    pdf_key = str(path)
     st = path.stat()
-    key = (path.name, st.st_mtime_ns, st.st_size, page_idx, "png")
+    key = (pdf_key, st.st_mtime_ns, st.st_size, page_idx, f"png@{clamped_scale}")
     with _cache_lock:
         cached = _page_cache.get(key)
         if cached is not None:
             return cached, st.st_mtime
 
     pdf_bytes, mtime, snap_ns, snap_size, stable = _read_pdf_snapshot(path)
-    key = (path.name, snap_ns, snap_size, page_idx, "png")
+    key = (pdf_key, snap_ns, snap_size, page_idx, f"png@{clamped_scale}")
 
     with _mupdf_lock:
         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
@@ -1427,23 +1601,34 @@ def render_page_png(filename: str | None, page_idx: int) -> tuple[bytes, float]:
             if page_idx < 0 or page_idx >= len(doc):
                 raise IndexError("Page out of range")
             page = doc[page_idx]
-            pix = page.get_pixmap(matrix=pymupdf.Matrix(RENDER_SCALE, RENDER_SCALE), alpha=False)
+            pix = page.get_pixmap(matrix=pymupdf.Matrix(clamped_scale, clamped_scale), alpha=False)
             png_bytes = pix.tobytes("png")
         finally:
             doc.close()
 
     if stable:
         with _cache_lock:
-            _page_cache.evict_where(lambda k: k[0] == path.name and (k[1], k[2]) != (snap_ns, snap_size))
+            _page_cache.evict_where(lambda k: k[0] == pdf_key and (k[1], k[2]) != (snap_ns, snap_size))
             _page_cache[key] = png_bytes
     return png_bytes, mtime
 
 
-def search_pdf(filename: str | None, query: str) -> list[dict]:
+def render_page_png_b64_for(pdf_path: Path, page_idx: int, zoom: float = 2.0) -> str:
+    png_bytes, _ = _render_page_png_bytes(pdf_path, int(page_idx), scale=zoom)
+    return base64.b64encode(png_bytes).decode("ascii")
+
+
+def render_page_png(filename: str | None, page_idx: int) -> tuple[bytes, float]:
+    return _render_page_png_bytes(resolve_pdf(filename), int(page_idx), scale=RENDER_SCALE)
+
+
+def search_pdf_for(pdf_path: Path, query: str) -> list[dict]:
     q = query.strip()
     if not q:
         return []
-    path = resolve_pdf(filename)
+    path = Path(pdf_path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"PDF not found: {path.name}")
     pdf_bytes, _, _, _, _ = _read_pdf_snapshot(path)
     matches = []
     with _mupdf_lock:
@@ -1465,6 +1650,44 @@ def search_pdf(filename: str | None, query: str) -> list[dict]:
     return matches
 
 
+def search_pdf(filename: str | None, query: str) -> list[dict]:
+    return search_pdf_for(resolve_pdf(filename), query)
+
+
+def render_viewer_html(
+    *,
+    mode: str = "http",
+    viewer_token: str = "",
+    csp_nonce: str = "",
+    mcp_bridge_js: str = "",
+) -> str:
+    """Render the self-contained viewer HTML for either standalone HTTP mode or Antigravity MCP App mode."""
+    if mode not in ("http", "mcp-app"):
+        raise ValueError(f"Unsupported viewer mode: {mode!r}")
+    if mode == "mcp-app":
+        safe_bridge = re.sub(r"</(script)", r"<\/\1", mcp_bridge_js or "", flags=re.IGNORECASE)
+        bridge_block = (
+            '  <script>window.__CHENGMEN_MODE__ = "mcp-app";</script>\n'
+            f"  <script>\n{safe_bridge}\n  </script>\n"
+        )
+        nonce_attr = ""
+        token_json = '""'
+        mode_json = '"mcp-app"'
+    else:
+        bridge_block = ""
+        nonce_attr = f' nonce="{csp_nonce}"' if csp_nonce else ""
+        token_json = json.dumps(viewer_token)
+        mode_json = '"http"'
+
+    return (
+        HTML_PAGE
+        .replace("__MCP_BRIDGE_BLOCK__", bridge_block)
+        .replace("__SCRIPT_NONCE_ATTR__", nonce_attr)
+        .replace("__VIEWER_MODE__", mode_json)
+        .replace("__VIEWER_SESSION_TOKEN__", token_json)
+    )
+
+
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1473,22 +1696,42 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <title>Paper Bilingual Vector Preview</title>
   <style>
     :root {
-      --bg: #1a1c20;
-      --toolbar: #25282e;
-      --panel: #202228;
-      --card: #282b33;
-      --card-hover: #2f333d;
+      --bg: var(--color-background-primary, #1a1c20);
+      --toolbar: var(--color-background-secondary, #25282e);
+      --panel: var(--color-background-secondary, #202228);
+      --card: var(--color-background-tertiary, #282b33);
+      --card-hover: var(--color-background-secondary, #2f333d);
       --card-active: #2a354a;
-      --border: #3a3e47;
-      --text: #eaecef;
-      --zh-text: #eef1f6;
-      --muted: #98a0ad;
-      --accent: #6aa1ff;
+      --border: var(--color-border-primary, #3a3e47);
+      --border-subtle: var(--color-border-secondary, #333845);
+      --text: var(--color-text-primary, #eaecef);
+      --zh-text: var(--color-text-primary, #eef1f6);
+      --muted: var(--color-text-secondary, #98a0ad);
+      --tertiary: var(--color-text-tertiary, #7f8794);
+      --accent: var(--color-ring-info, #6aa1ff);
       --accent-soft: rgba(106, 161, 255, 0.16);
-      --todo: #f6b73c;
+      --todo: var(--color-text-warning, #f6b73c);
       --todo-soft: rgba(246, 183, 60, 0.16);
-      --btn-bg: #32363f;
-      --btn-hover: #404550;
+      --btn-bg: var(--color-background-tertiary, #32363f);
+      --btn-hover: var(--color-border-primary, #404550);
+    }
+    [data-theme="light"] {
+      --bg: var(--color-background-primary, #f4f6f9);
+      --toolbar: var(--color-background-secondary, #ffffff);
+      --panel: var(--color-background-secondary, #f8f9fb);
+      --card: var(--color-background-primary, #ffffff);
+      --card-hover: var(--color-background-tertiary, #eef2f7);
+      --card-active: rgba(37, 99, 235, 0.10);
+      --border: var(--color-border-primary, #d5dbe4);
+      --border-subtle: var(--color-border-secondary, #e2e8f0);
+      --text: var(--color-text-primary, #1b2230);
+      --zh-text: var(--color-text-primary, #1f2937);
+      --muted: var(--color-text-secondary, #5f6b7d);
+      --tertiary: var(--color-text-tertiary, #7a8599);
+      --accent: var(--color-ring-info, #2563eb);
+      --accent-soft: rgba(37, 99, 235, 0.12);
+      --btn-bg: var(--color-background-tertiary, #eef2f7);
+      --btn-hover: var(--color-border-primary, #dde4ee);
     }
     * { box-sizing: border-box; }
     html, body {
@@ -1497,7 +1740,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       height: 100%;
       background: var(--bg);
       color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Roboto, sans-serif;
+      font-family: var(--font-sans, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Roboto, sans-serif);
       font-size: 13px;
       overflow: hidden;
     }
@@ -2135,7 +2378,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       position: fixed;
       right: 16px;
       bottom: 16px;
-      background: rgba(37, 40, 46, 0.96);
+      background: var(--toolbar);
       border: 1px solid var(--accent);
       color: var(--text);
       padding: 6px 12px;
@@ -2144,9 +2387,137 @@ HTML_PAGE = r"""<!DOCTYPE html>
       opacity: 0;
       transition: opacity 0.25s;
       pointer-events: none;
-      z-index: 50;
+      z-index: 90;
     }
     .toast.show { opacity: 1; }
+
+    .mcp-only { display: none; }
+    body.is-mcp-app .mcp-only { display: inline-flex; }
+    .mcp-cap-hidden { display: none !important; }
+    .mcp-action-btn {
+      height: 20px;
+      font-size: 10.5px;
+      padding: 0 6px;
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      margin-left: 3px;
+    }
+    .mcp-action-btn:hover {
+      border-color: var(--accent);
+      color: var(--text);
+      background: var(--accent-soft);
+    }
+    .sel-action-bar {
+      position: fixed;
+      display: none;
+      align-items: center;
+      gap: 4px;
+      padding: 4px 6px;
+      background: var(--toolbar);
+      border: 1px solid var(--accent);
+      border-radius: 7px;
+      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.42);
+      z-index: 85;
+    }
+    .sel-action-bar.open { display: flex; }
+    .sel-action-bar button {
+      height: 22px;
+      font-size: 11px;
+      padding: 0 8px;
+    }
+    .empty-guide {
+      position: absolute;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg);
+      z-index: 40;
+      padding: 20px;
+      overflow-y: auto;
+    }
+    .empty-guide.open { display: flex; }
+    .empty-guide-card {
+      width: 100%;
+      max-width: 520px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px 22px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      box-shadow: 0 8px 28px rgba(0, 0, 0, 0.25);
+    }
+    .empty-guide-title {
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .empty-guide-sub {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+    .empty-guide-form {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .empty-guide-form input {
+      width: 100%;
+      height: 30px;
+      font-size: 12px;
+      padding: 0 10px;
+    }
+    .empty-guide-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .empty-guide-actions button.primary {
+      background: var(--accent-soft);
+      border-color: var(--accent);
+      color: var(--text);
+      font-weight: 600;
+      height: 30px;
+      padding: 0 14px;
+    }
+    .recent-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-height: 220px;
+      overflow-y: auto;
+    }
+    .recent-item {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border-subtle);
+      background: var(--panel);
+      cursor: pointer;
+      text-align: left;
+    }
+    .recent-item:hover {
+      border-color: var(--accent);
+      background: var(--card-hover);
+    }
+    .recent-item-name {
+      font-size: 12.5px;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .recent-item-path {
+      font-size: 11px;
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
   </style>
 </head>
 <body>
@@ -2154,6 +2525,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="toolbar">
       <div class="group">
         <select id="fileSelect" title="选择 PDF"></select>
+        <button id="openPaperPickerBtn" class="mcp-only" title="打开本地 PDF 文件或切换论文目录">📂 换论文</button>
+        <button id="openTexBtn" class="mcp-only mcp-cap-hidden" title="在 Antigravity 侧栏打开对应 .tex 源码">📄 源码</button>
       </div>
       <div class="sep"></div>
       <div class="group">
@@ -2184,7 +2557,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
       <div class="spacer"></div>
       <div class="group">
-        <span class="live-badge" title="每 1.5 秒自动检测 PDF 与中文对照更新">
+        <span class="live-badge" title="自动检测 PDF 与中文对照更新">
           <span id="liveDot" class="dot"></span>
           <span id="updatedAt">--:--:--</span>
         </span>
@@ -2193,6 +2566,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
 
     <div class="body-wrap">
+      <div id="emptyGuide" class="empty-guide">
+        <div class="empty-guide-card">
+          <div class="empty-guide-title">Chengmen Paper Viewer — 打开本地论文</div>
+          <div id="emptyGuideSub" class="empty-guide-sub">输入本地 PDF 文件路径（或含 PDF 的论文目录），或从下方最近打开列表中一键恢复。</div>
+          <div class="empty-guide-form">
+            <input id="guidePdfInput" type="text" placeholder="本地 PDF 路径或目录（例如 paper/main.pdf）" />
+            <input id="guideZhInput" type="text" placeholder="可选：中文对照 JSON 路径（留空自动查找 *_zh.json）" />
+            <div class="empty-guide-actions">
+              <button id="guideOpenBtn" class="primary">打开论文</button>
+              <button id="guideCloseBtn" style="display:none;">返回当前论文</button>
+            </div>
+          </div>
+          <div id="recentSection" style="display:none;">
+            <div class="muted" style="margin-bottom:6px;">最近打开的论文</div>
+            <div id="recentList" class="recent-list"></div>
+          </div>
+        </div>
+      </div>
       <aside id="searchDrawer" class="search-drawer"></aside>
       <div id="splitContainer" class="split-container dir-row">
         <main id="viewer" class="viewer"><div id="viewerInner" class="viewer-inner"></div></main>
@@ -2238,12 +2629,55 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
     </div>
   </div>
+  <div id="selActionBar" class="sel-action-bar">
+    <button id="selAttachBtn" title="将所选片段附加到下一条对话上下文">📎 附加到对话</button>
+    <button id="selReviewBtn" title="发送所选片段请 Agent 审校润色">✨ 发给 Agent 审校</button>
+  </div>
   <div id="hoverPill" class="hover-pill"></div>
   <div id="toast" class="toast"></div>
 
-  <script nonce="__CSP_NONCE__">
+__MCP_BRIDGE_BLOCK__  <script__SCRIPT_NONCE_ATTR__>
+    const VIEWER_MODE = __VIEWER_MODE__;
     const VIEWER_TOKEN = __VIEWER_SESSION_TOKEN__;
-    let currentFile = new URLSearchParams(location.search).get('file') || '';
+    const IS_MCP_APP = (VIEWER_MODE === 'mcp-app') || (window.__CHENGMEN_MODE__ === 'mcp-app');
+    const MCP_BRIDGE = IS_MCP_APP ? (window.__CHENGMEN_MCP_BRIDGE__ || null) : null;
+    if (IS_MCP_APP && document.body) {
+      document.body.classList.add('is-mcp-app');
+    }
+
+    function safeStorageGet(key, fallback = null) {
+      try {
+        const v = window.localStorage.getItem(key);
+        return v === null ? fallback : v;
+      } catch (_) {
+        return fallback;
+      }
+    }
+    function safeStorageSet(key, val) {
+      try {
+        window.localStorage.setItem(key, String(val));
+      } catch (_) {}
+    }
+
+    let currentFile = '';
+    try {
+      currentFile = new URLSearchParams(location.search).get('file') || '';
+    } catch (_) {
+      currentFile = '';
+    }
+    let currentPdfPath = '';
+    let currentPaperDir = '';
+    let currentZhPath = '';
+    let currentTexPath = '';
+    let currentTexUri = '';
+    let recentPapers = [];
+    let mcpCapabilities = { serverTools: false, message: false, updateModelContext: false, openLinks: false };
+    let auxPaneUnsupported = false;
+    let lastSelectionPayload = null;
+    let saveStateTimer = null;
+    const activeBlobUrls = new Set();
+    const mcpLoadedTextPages = new Map(); // page_idx -> { w, h, runs }
+    let mcpPageObserver = null;
     let currentMeta = null;
     let currentZh = null;
     let currentPage = 1;
@@ -2267,15 +2701,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
     let hoveredPdfLink = null;  // { page, link }
     let jumpHistory = [];       // [{ scrollRatioY, scrollRatioX, page, zhScroll, selectedZhId, activeSent }]
 
-    let zhVisible = localStorage.getItem('paper_zh_visible') !== '0';
-    let splitDir = localStorage.getItem('paper_split_dir') || (window.innerWidth < 760 ? 'col' : 'row');
-    let zhFilterMode = localStorage.getItem('paper_zh_filter') || 'all';
-    let autoFollow = localStorage.getItem('paper_zh_follow') !== '0';
-    let showPdfLockMarks = localStorage.getItem('paper_pdf_lock_marks') === '1';
+    let zhVisible = safeStorageGet('paper_zh_visible') !== '0';
+    let splitDir = safeStorageGet('paper_split_dir') || (window.innerWidth < 760 ? 'col' : 'row');
+    let zhFilterMode = safeStorageGet('paper_zh_filter') || 'all';
+    let autoFollow = safeStorageGet('paper_zh_follow') !== '0';
+    let showPdfLockMarks = safeStorageGet('paper_pdf_lock_marks') === '1';
     let suppressNextAutoFollow = false;
     let suppressAutoFollowTimer = null;
     let lastRenderedFilterPage = null;
     let fileSwitchEpoch = 0;
+    let openPayloadSeq = 0;
     let metaInFlight = false;
     let zhInFlight = false;
     let metaAbortCtrl = null;
@@ -2284,6 +2719,53 @@ HTML_PAGE = r"""<!DOCTYPE html>
     let pollTimer = null;
     let lockedSet = new Set();
     let lockMode = 'deny';
+
+    function revokeAllBlobUrls() {
+      activeBlobUrls.forEach(u => {
+        try { URL.revokeObjectURL(u); } catch (_) {}
+      });
+      activeBlobUrls.clear();
+      if (mcpPageObserver) {
+        try { mcpPageObserver.disconnect(); } catch (_) {}
+        mcpPageObserver = null;
+      }
+      mcpLoadedTextPages.clear();
+    }
+    window.addEventListener('beforeunload', revokeAllBlobUrls);
+
+    function scheduleSaveUiState() {
+      if (!IS_MCP_APP || !MCP_BRIDGE) return;
+      if (saveStateTimer) clearTimeout(saveStateTimer);
+      saveStateTimer = setTimeout(() => {
+        saveStateTimer = null;
+        MCP_BRIDGE.callTool('app_save_state', {
+          ui_state: {
+            zhVisible,
+            splitDir,
+            zhFilterMode,
+            autoFollow,
+            showPdfLockMarks,
+            zoomMode,
+            zoomScale,
+          },
+        }, 1).catch(() => {});
+      }, 300);
+    }
+
+    function hydrateUiState(uiState) {
+      if (!uiState || typeof uiState !== 'object') return;
+      if (typeof uiState.zhVisible === 'boolean') zhVisible = uiState.zhVisible;
+      if (uiState.splitDir === 'row' || uiState.splitDir === 'col') splitDir = uiState.splitDir;
+      if (['all', 'page', 'locked', 'todo'].includes(uiState.zhFilterMode)) zhFilterMode = uiState.zhFilterMode;
+      if (typeof uiState.autoFollow === 'boolean') autoFollow = uiState.autoFollow;
+      if (typeof uiState.showPdfLockMarks === 'boolean') showPdfLockMarks = uiState.showPdfLockMarks;
+      if (uiState.zoomMode === 'fit' || uiState.zoomMode === 'manual') zoomMode = uiState.zoomMode;
+      if (typeof uiState.zoomScale === 'number' && uiState.zoomScale >= 0.45 && uiState.zoomScale <= 5.0) {
+        zoomScale = uiState.zoomScale;
+      }
+      applyLayoutState(false);
+      if (zoomMode === 'manual') applyZoom();
+    }
 
     function suppressAutoFollowBriefly(ms = 750) {
       suppressNextAutoFollow = true;
@@ -2303,6 +2785,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
 
     const fileSelect = document.getElementById('fileSelect');
+    const openPaperPickerBtn = document.getElementById('openPaperPickerBtn');
+    const openTexBtn = document.getElementById('openTexBtn');
+    const emptyGuide = document.getElementById('emptyGuide');
+    const emptyGuideSub = document.getElementById('emptyGuideSub');
+    const guidePdfInput = document.getElementById('guidePdfInput');
+    const guideZhInput = document.getElementById('guideZhInput');
+    const guideOpenBtn = document.getElementById('guideOpenBtn');
+    const guideCloseBtn = document.getElementById('guideCloseBtn');
+    const recentSection = document.getElementById('recentSection');
+    const recentList = document.getElementById('recentList');
+    const selActionBar = document.getElementById('selActionBar');
+    const selAttachBtn = document.getElementById('selAttachBtn');
+    const selReviewBtn = document.getElementById('selReviewBtn');
     const viewer = document.getElementById('viewer');
     const viewerInner = document.getElementById('viewerInner');
     const pageInput = document.getElementById('pageInput');
@@ -2345,6 +2840,251 @@ HTML_PAGE = r"""<!DOCTYPE html>
       toast.classList.add('show');
       if (toastTimer) clearTimeout(toastTimer);
       toastTimer = setTimeout(() => toast.classList.remove('show'), 1900);
+    }
+
+    function updateOpenTexButton() {
+      if (!openTexBtn) return;
+      const show = IS_MCP_APP && !auxPaneUnsupported && Boolean(currentTexUri);
+      openTexBtn.classList.toggle('mcp-cap-hidden', !show);
+      if (currentTexPath) {
+        openTexBtn.title = `在侧栏打开源码：${currentTexPath}`;
+      }
+    }
+
+    function applyCapabilityVisibility() {
+      if (!IS_MCP_APP) return;
+      if (MCP_BRIDGE) {
+        mcpCapabilities = MCP_BRIDGE.getCapabilities();
+      }
+      const canCtx = Boolean(mcpCapabilities.updateModelContext);
+      const canMsg = Boolean(mcpCapabilities.message);
+      document.querySelectorAll('.mcp-ctx-btn').forEach(btn => btn.classList.toggle('mcp-cap-hidden', !canCtx));
+      document.querySelectorAll('.mcp-msg-btn').forEach(btn => btn.classList.toggle('mcp-cap-hidden', !canMsg));
+      if (selAttachBtn) selAttachBtn.classList.toggle('mcp-cap-hidden', !canCtx);
+      if (selReviewBtn) selReviewBtn.classList.toggle('mcp-cap-hidden', !canMsg);
+      if (!canCtx && !canMsg) hideSelectionActionBar();
+      updateOpenTexButton();
+    }
+
+    function hideSelectionActionBar() {
+      if (selActionBar) selActionBar.classList.remove('open');
+      lastSelectionPayload = null;
+    }
+
+    function showSelectionActionBar(range, payload) {
+      if (!IS_MCP_APP || !selActionBar) return;
+      const canCtx = Boolean(mcpCapabilities.updateModelContext);
+      const canMsg = Boolean(mcpCapabilities.message);
+      if (!canCtx && !canMsg) return;
+      lastSelectionPayload = payload;
+      const rect = range.getBoundingClientRect();
+      const left = Math.max(10, Math.min(window.innerWidth - 230, rect.left + rect.width / 2 - 105));
+      const top = rect.top > 48 ? (rect.top - 36) : Math.min(window.innerHeight - 40, rect.bottom + 8);
+      selActionBar.style.left = `${Math.round(left)}px`;
+      selActionBar.style.top = `${Math.round(top)}px`;
+      selActionBar.classList.add('open');
+    }
+
+    function formatItemContextMarkdown(item, extraSnippet = '') {
+      const lines = [
+        `Paper: ${currentFile || '(unknown)'}`,
+        currentTexPath ? `TeX: ${currentTexPath}` : '',
+        item ? `Paragraph ID: ${item.id} | Page: P${item.page}${item.lines ? ' | Lines: ' + item.lines : ''}${item.section ? ' | Section: ' + item.section : ''}` : `Page: P${currentPage}`,
+        item ? `Lock status: ${lockedSet.has(item.id) ? 'LOCKED (do not edit without unlocking)' : 'unlocked'}` : '',
+      ].filter(Boolean);
+      if (extraSnippet) {
+        lines.push('', 'Selected excerpt:', extraSnippet);
+      }
+      if (item && item.en_preview) {
+        lines.push('', 'English preview:', item.en_preview);
+      }
+      if (item && item.zh) {
+        lines.push('', 'Chinese companion:', item.zh);
+      }
+      return lines.join('\n');
+    }
+
+    async function attachContextToAgent(item, extraSnippet = '') {
+      if (!IS_MCP_APP || !MCP_BRIDGE || !mcpCapabilities.updateModelContext) return;
+      try {
+        const md = formatItemContextMarkdown(item, extraSnippet);
+        await MCP_BRIDGE.updateModelContext([{ type: 'text', text: md }]);
+        const label = item ? item.id : `P${currentPage} 选区`;
+        showToast(`已将 ${label} 附加到对话上下文`);
+        hideSelectionActionBar();
+      } catch (e) {
+        console.error(e);
+        showToast('附加到对话失败');
+      }
+    }
+
+    async function sendReviewToAgent(item, extraSnippet = '') {
+      if (!IS_MCP_APP || !MCP_BRIDGE || !mcpCapabilities.message) return;
+      try {
+        const md = formatItemContextMarkdown(item, extraSnippet);
+        if (mcpCapabilities.updateModelContext) {
+          await MCP_BRIDGE.updateModelContext([{ type: 'text', text: md }]).catch(() => {});
+        }
+        const label = item ? `${item.id}${item.lines ? ' (' + item.lines + ')' : ''}` : `第 ${currentPage} 页选中片段`;
+        const prompt = mcpCapabilities.updateModelContext
+          ? `请审校论文 ${currentFile} 的 ${label}（见已附加的段落与中英文上下文）：检查学术表达、逻辑连贯性与中英一致性，如已锁定请仅给修改建议不要直接改源码。`
+          : `请审校以下论文片段（如已锁定请仅给修改建议不要直接改源码）：\n\n${md}`;
+        const res = await MCP_BRIDGE.sendMessage(prompt);
+        if (res && res.ok) {
+          showToast(`已发送 ${label} 给 Agent 审校`);
+        } else {
+          showToast('发送消息被宿主拒绝');
+        }
+        hideSelectionActionBar();
+      } catch (e) {
+        console.error(e);
+        showToast('发送审校消息失败');
+      }
+    }
+
+    function renderRecentPapers() {
+      if (!recentSection || !recentList) return;
+      recentList.textContent = '';
+      if (!Array.isArray(recentPapers) || recentPapers.length === 0) {
+        recentSection.style.display = 'none';
+        return;
+      }
+      recentSection.style.display = 'block';
+      recentPapers.forEach(rp => {
+        const btn = document.createElement('button');
+        btn.className = 'recent-item';
+        const nm = document.createElement('div');
+        nm.className = 'recent-item-name';
+        nm.textContent = rp.title_zh ? `${rp.file || rp.pdf_path} — ${rp.title_zh}` : (rp.file || rp.pdf_path || '未命名 PDF');
+        const pth = document.createElement('div');
+        pth.className = 'recent-item-path';
+        pth.textContent = rp.pdf_path || rp.paper_dir || '';
+        btn.appendChild(nm);
+        btn.appendChild(pth);
+        btn.onclick = () => {
+          selectPaperViaMcp({
+            pdf_path: rp.pdf_path || undefined,
+            paper_dir: rp.paper_dir || undefined,
+            zh_path: rp.zh_path || undefined,
+          });
+        };
+        recentList.appendChild(btn);
+      });
+    }
+
+    function showEmptyGuide(note = '') {
+      if (!emptyGuide) return;
+      if (emptyGuideSub) {
+        emptyGuideSub.textContent = note || '输入本地 PDF 文件路径（或含 PDF 的论文目录），或从下方最近打开列表中一键恢复。';
+      }
+      if (guidePdfInput && !guidePdfInput.value && (currentPdfPath || currentPaperDir)) {
+        guidePdfInput.value = currentPdfPath || currentPaperDir;
+      }
+      if (guideZhInput && !guideZhInput.value && currentZhPath) {
+        guideZhInput.value = currentZhPath;
+      }
+      if (guideCloseBtn) {
+        guideCloseBtn.style.display = currentMeta ? 'inline-flex' : 'none';
+      }
+      renderRecentPapers();
+      emptyGuide.classList.add('open');
+    }
+
+    function hideEmptyGuide() {
+      if (emptyGuide) emptyGuide.classList.remove('open');
+    }
+
+    async function selectPaperViaMcp(args) {
+      if (!IS_MCP_APP || !MCP_BRIDGE) return;
+      try {
+        liveDot.classList.add('updating');
+        const payload = await MCP_BRIDGE.callTool('app_select_paper', args || {}, 10);
+        await applyOpenPaperPayload(payload);
+      } catch (e) {
+        console.error(e);
+        showToast('打开论文失败: ' + (e?.message || e));
+      } finally {
+        setTimeout(() => liveDot.classList.remove('updating'), 300);
+      }
+    }
+
+    async function applyOpenPaperPayload(sc) {
+      if (!sc || typeof sc !== 'object') return;
+      const payloadSeq = ++openPayloadSeq;
+      if (Array.isArray(sc.recent_papers)) {
+        recentPapers = sc.recent_papers;
+      }
+      if (sc.ui_state) {
+        hydrateUiState(sc.ui_state);
+      }
+      if (sc.has_paper === false) {
+        showEmptyGuide(sc.note || '');
+        return;
+      }
+      hideEmptyGuide();
+
+      const incomingPdfPath = sc.pdf_path || sc.meta?.pdf_path || '';
+      const incomingFile = sc.file || sc.meta?.file || '';
+      const switchedPdf = !currentMeta
+        || (Boolean(incomingPdfPath) && incomingPdfPath !== currentPdfPath)
+        || (Boolean(incomingFile) && incomingFile !== currentFile);
+      const nextZhPath = typeof sc.zh_path === 'string'
+        ? sc.zh_path
+        : (switchedPdf ? '' : currentZhPath);
+      const zhPathChanged = nextZhPath !== currentZhPath;
+
+      if (switchedPdf) {
+        fileSwitchEpoch += 1;
+        if (metaAbortCtrl) metaAbortCtrl.abort();
+        if (zhAbortCtrl) zhAbortCtrl.abort();
+        if (textAbortCtrl) textAbortCtrl.abort();
+      } else if (zhPathChanged) {
+        if (zhAbortCtrl) zhAbortCtrl.abort();
+        currentZh = null;
+      }
+      const epoch = fileSwitchEpoch;
+
+      currentPdfPath = incomingPdfPath || currentPdfPath;
+      currentPaperDir = sc.paper_dir || sc.meta?.paper_dir || currentPaperDir;
+      currentZhPath = nextZhPath;
+      currentFile = incomingFile || currentFile;
+      if (switchedPdf) {
+        currentMeta = null;
+        currentZh = null;
+        currentPage = 1;
+        selectedZhId = null;
+        activeSent = null;
+        hoverSent = null;
+        hoveredPdfLink = null;
+        hoveredItemId = null;
+        hoveredPage = null;
+        jumpHistory = [];
+        updateBackJumpBtn();
+        hoverPill.style.display = 'none';
+        hideSelectionActionBar();
+      }
+
+      if (sc.meta && !sc.meta_deferred) {
+        applyLoadedMeta(sc.meta, !switchedPdf, false, epoch);
+      } else {
+        await loadMeta(!switchedPdf, false);
+      }
+      if (epoch !== fileSwitchEpoch || payloadSeq !== openPayloadSeq) return;
+
+      if (sc.zh && !sc.zh_deferred) {
+        applyLoadedZh(sc.zh, false);
+      } else {
+        await loadZh(false);
+      }
+      if (epoch !== fileSwitchEpoch || payloadSeq !== openPayloadSeq) return;
+
+      if (sc.jump_id && itemById[sc.jump_id]) {
+        jumpToZhItem(sc.jump_id, true);
+        jumpToPdfItem(sc.jump_id, sc.page || itemById[sc.jump_id].page || 1);
+        flashPdfBlock(sc.jump_id);
+      } else if (sc.page && Number(sc.page) >= 1) {
+        jumpToPage(Number(sc.page));
+      }
     }
 
     function indexZhData(zh) {
@@ -2547,6 +3287,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function jumpToPdfLink(lnk) {
       if (!lnk) return;
       if (lnk.t === 'uri' && lnk.u) {
+        if (IS_MCP_APP) {
+          if (MCP_BRIDGE && /^https?:\/\//i.test(lnk.u)) {
+            MCP_BRIDGE.openLink({ url: lnk.u }).then(res => {
+              if (!res || !res.ok) showToast(`链接地址：${lnk.u}`);
+            }).catch(() => showToast(`链接地址：${lnk.u}`));
+          } else {
+            showToast(`外部链接：${lnk.u}`);
+          }
+          return;
+        }
         window.open(lnk.u, '_blank', 'noopener,noreferrer');
         return;
       }
@@ -2558,6 +3308,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       currentPage = targetPage;
       pageInput.value = targetPage;
       if (pageCard) {
+        ensureMcpPageLoaded(targetPage, 8);
         const cardRect = pageCard.getBoundingClientRect();
         const vRect = viewer.getBoundingClientRect();
         const cardTopInViewer = cardRect.top - vRect.top + viewer.scrollTop;
@@ -2584,6 +3335,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const safePage = Math.max(1, Math.min(maxPage || 1, Number(prev.page) || 1));
       currentPage = safePage;
       pageInput.value = safePage;
+      ensureMcpPageLoaded(safePage, 8);
       selectedZhId = prev.selectedZhId;
       activeSent = prev.activeSent;
       const targetTop = Math.round((prev.scrollRatioY || 0) * viewer.scrollHeight);
@@ -2746,26 +3498,48 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     async function postLockAction(action, ids = [], mode = null) {
       try {
-        const payload = { file: currentFile, action, ids };
-        if (mode) payload.mode = mode;
-        const res = await fetch('/api/locks', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Viewer-Token': VIEWER_TOKEN,
-          },
-          body: JSON.stringify(payload),
-        });
-        const data = await res.json();
-        if (!res.ok || data.error) {
-          showToast('锁定更新失败: ' + (data.error || res.status));
-          return;
+        let data;
+        if (IS_MCP_APP) {
+          if (!MCP_BRIDGE) {
+            showToast('MCP 桥接未就绪，暂无法更新锁定');
+            return;
+          }
+          const toolArgs = {
+            action,
+            ids,
+            file: currentFile || undefined,
+            pdf_path: currentPdfPath || undefined,
+            zh_path: currentZhPath || undefined,
+          };
+          if (mode) toolArgs.mode = mode;
+          data = await MCP_BRIDGE.callTool('app_update_locks', toolArgs, 10);
+          if (!data || data.error) {
+            showToast('锁定更新失败: ' + (data?.error || 'unknown error'));
+            return;
+          }
+        } else {
+          const payload = { file: currentFile, action, ids };
+          if (mode) payload.mode = mode;
+          const res = await fetch('/api/locks', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Viewer-Token': VIEWER_TOKEN,
+            },
+            body: JSON.stringify(payload),
+          });
+          data = await res.json();
+          if (!res.ok || data.error) {
+            showToast('锁定更新失败: ' + (data.error || res.status));
+            return;
+          }
         }
         lockedSet = new Set(data.locked_ids || []);
         lockMode = data.mode === 'force_ask' ? 'force_ask' : 'deny';
         if (currentZh) {
           currentZh.locked_ids = data.locked_ids || [];
           currentZh.lock_mode = lockMode;
+          currentZh.mode = lockMode;
           currentZh.locks_mtime = data.locks_mtime || Date.now() / 1000;
           (currentZh.items || []).forEach(it => { it.locked = lockedSet.has(it.id); });
         }
@@ -2786,7 +3560,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         }
       } catch (e) {
         console.error(e);
-        showToast('锁定请求异常');
+        showToast('锁定请求异常: ' + (e?.message || ''));
       }
     }
 
@@ -2895,6 +3669,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
       currentPage = primary.page;
       pageInput.value = primary.page;
+      ensureMcpPageLoaded(primary.page, 8);
       const cardRect = pageCard.getBoundingClientRect();
       const vRect = viewer.getBoundingClientRect();
       const cardTopInViewer = cardRect.top - vRect.top + viewer.scrollTop;
@@ -2933,15 +3708,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
       if (zhFilterMode === 'todo' && !item.is_todo) {
         zhFilterMode = 'all';
-        localStorage.setItem('paper_zh_filter', 'all');
+        safeStorageSet('paper_zh_filter', 'all');
+        scheduleSaveUiState();
         needRerender = true;
       } else if (zhFilterMode === 'locked' && !lockedSet.has(item.id)) {
         zhFilterMode = 'all';
-        localStorage.setItem('paper_zh_filter', 'all');
+        safeStorageSet('paper_zh_filter', 'all');
+        scheduleSaveUiState();
         needRerender = true;
       } else if (zhFilterMode === 'page' && !itemMatchesPage(item, currentPage)) {
         zhFilterMode = 'all';
-        localStorage.setItem('paper_zh_filter', 'all');
+        safeStorageSet('paper_zh_filter', 'all');
+        scheduleSaveUiState();
         needRerender = true;
       }
 
@@ -2982,6 +3760,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
       currentPage = primary.page;
       pageInput.value = primary.page;
+      ensureMcpPageLoaded(primary.page, 8);
       const cardRect = pageCard.getBoundingClientRect();
       const vRect = viewer.getBoundingClientRect();
       const cardTopInViewer = cardRect.top - vRect.top + viewer.scrollTop;
@@ -2993,7 +3772,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       renderPdfOverlays();
     }
 
-    function applyLayoutState() {
+    function applyLayoutState(persist = true) {
       zhPane.classList.toggle('hidden', !zhVisible);
       splitter.classList.toggle('hidden', !zhVisible);
       zhToggleBtn.classList.toggle('active', zhVisible);
@@ -3003,8 +3782,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
       splitDirBtn.textContent = splitDir === 'row' ? '左右分栏' : '上下分栏';
       splitDirBtn.style.display = zhVisible ? 'inline-flex' : 'none';
 
-      localStorage.setItem('paper_zh_visible', zhVisible ? '1' : '0');
-      localStorage.setItem('paper_split_dir', splitDir);
+      if (persist) {
+        safeStorageSet('paper_zh_visible', zhVisible ? '1' : '0');
+        safeStorageSet('paper_split_dir', splitDir);
+        scheduleSaveUiState();
+      }
       requestAnimationFrame(() => { if (zoomMode === 'fit') applyZoom(); });
     }
 
@@ -3038,6 +3820,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       zoomScale = clamped;
       zoomMode = 'manual';
       applyZoom();
+      scheduleSaveUiState();
 
       viewer.scrollLeft = Math.max(0, ratioX * viewer.scrollWidth - relX);
       viewer.scrollTop = Math.max(0, ratioY * viewer.scrollHeight - relY);
@@ -3192,47 +3975,129 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const _measureCanvas = document.createElement('canvas');
     const _measureCtx = _measureCanvas.getContext('2d');
 
+    function populateSinglePageTextLayer(card, pInfo) {
+      if (!card || !pInfo) return;
+      const tl = card.querySelector('.page-text-layer');
+      if (!tl) return;
+      tl.textContent = '';
+      const pw = pInfo.w || Number(card.dataset.pw) || 612;
+      const ph = pInfo.h || Number(card.dataset.ph) || 792;
+      const frag = document.createDocumentFragment();
+      (pInfo.runs || []).forEach(run => {
+        const [x0, y0, rw, rh, txt, sep] = run;
+        if (!txt) return;
+        // Defensive skip for degenerate vertical/rotated bounding boxes
+        if (rh > rw * 1.8 && rh > 20) return;
+        const fsPt = Math.max(4.5, Math.min(36, rh * 0.86));
+        _measureCtx.font = `${fsPt.toFixed(2)}px "Times New Roman", Times, Georgia, serif`;
+        const natW = Math.max(1.0, _measureCtx.measureText(txt).width);
+        const sx = Math.max(0.55, Math.min(1.65, rw / natW));
+
+        const sp = document.createElement('span');
+        sp.className = 'pdf-tl-span';
+        sp.dataset.x0 = (x0 / pw).toFixed(4);
+        sp.dataset.x1 = ((x0 + rw) / pw).toFixed(4);
+        sp.dataset.nx = ((x0 + rw * 0.5) / pw).toFixed(4);
+        sp.dataset.ny = ((y0 + rh * 0.5) / ph).toFixed(4);
+        sp.style.left = ((x0 / pw) * 100).toFixed(3) + '%';
+        sp.style.top = ((y0 / ph) * 100).toFixed(3) + '%';
+        sp.style.fontSize = `calc(var(--page-scale) * ${fsPt.toFixed(2)}px)`;
+        sp.style.transform = `scaleX(${sx.toFixed(4)})`;
+        sp.textContent = txt;
+        frag.appendChild(sp);
+        if (sep) frag.appendChild(document.createTextNode(sep));
+      });
+      tl.appendChild(frag);
+    }
+
     function populateTextLayers(textData) {
       if (!textData || !Array.isArray(textData.pages)) return;
       if (currentMeta && textData.file && textData.file !== currentMeta.file) return;
       viewer.querySelectorAll('.page-card').forEach(card => {
         const pIdx = Number(card.dataset.page) - 1;
-        const tl = card.querySelector('.page-text-layer');
         const pInfo = textData.pages[pIdx];
-        if (!tl || !pInfo) return;
-        tl.innerHTML = '';
-        const pw = pInfo.w || 612;
-        const ph = pInfo.h || 792;
-        const frag = document.createDocumentFragment();
-        (pInfo.runs || []).forEach(run => {
-          const [x0, y0, rw, rh, txt, sep] = run;
-          if (!txt) return;
-          // Defensive skip for degenerate vertical/rotated bounding boxes
-          if (rh > rw * 1.8 && rh > 20) return;
-          const fsPt = Math.max(4.5, Math.min(36, rh * 0.86));
-          _measureCtx.font = `${fsPt.toFixed(2)}px "Times New Roman", Times, Georgia, serif`;
-          const natW = Math.max(1.0, _measureCtx.measureText(txt).width);
-          const sx = Math.max(0.55, Math.min(1.65, rw / natW));
-
-          const sp = document.createElement('span');
-          sp.className = 'pdf-tl-span';
-          sp.dataset.x0 = (x0 / pw).toFixed(4);
-          sp.dataset.x1 = ((x0 + rw) / pw).toFixed(4);
-          sp.dataset.nx = ((x0 + rw * 0.5) / pw).toFixed(4);
-          sp.dataset.ny = ((y0 + rh * 0.5) / ph).toFixed(4);
-          sp.style.left = ((x0 / pw) * 100).toFixed(3) + '%';
-          sp.style.top = ((y0 / ph) * 100).toFixed(3) + '%';
-          sp.style.fontSize = `calc(var(--page-scale) * ${fsPt.toFixed(2)}px)`;
-          sp.style.transform = `scaleX(${sx.toFixed(4)})`;
-          sp.textContent = txt;
-          frag.appendChild(sp);
-          if (sep) frag.appendChild(document.createTextNode(sep));
-        });
-        tl.appendChild(frag);
+        if (pInfo) {
+          mcpLoadedTextPages.set(pIdx, pInfo);
+          populateSinglePageTextLayer(card, pInfo);
+        }
       });
     }
 
+    async function loadMcpPageAssets(card, pageIdx, meta, epoch, priority = 2, signal = null) {
+      if (!IS_MCP_APP || !MCP_BRIDGE) return;
+      if (epoch !== fileSwitchEpoch) return;
+      if (card.dataset.mcpLoaded === '1' || card.dataset.mcpLoading === '1') return;
+      card.dataset.mcpLoading = '1';
+      const img = card.querySelector('img');
+      try {
+        const svgRes = await MCP_BRIDGE.callTool(
+          'app_get_page_svg',
+          { page_idx: pageIdx, pdf_path: currentPdfPath || undefined, file: meta.file },
+          { priority, signal },
+        );
+        if (epoch !== fileSwitchEpoch) return;
+        if (svgRes && typeof svgRes.svg === 'string' && svgRes.svg && img) {
+          const blobUrl = URL.createObjectURL(new Blob([svgRes.svg], { type: 'image/svg+xml;charset=utf-8' }));
+          activeBlobUrls.add(blobUrl);
+          img.src = blobUrl;
+          card.dataset.mcpLoaded = '1';
+        }
+      } catch (err) {
+        if (err?.name === 'AbortError' || epoch !== fileSwitchEpoch) return;
+        // Graceful fallback to PNG data URI if SVG fails
+        try {
+          const pngRes = await MCP_BRIDGE.callTool(
+            'app_get_page_png',
+            { page_idx: pageIdx, zoom: 2.0, pdf_path: currentPdfPath || undefined, file: meta.file },
+            { priority, signal },
+          );
+          if (epoch !== fileSwitchEpoch) return;
+          if (pngRes && typeof pngRes.png_b64 === 'string' && img) {
+            img.src = `data:${pngRes.mime_type || 'image/png'};base64,${pngRes.png_b64}`;
+            card.dataset.mcpLoaded = '1';
+          }
+        } catch (err2) {
+          if (err2?.name !== 'AbortError') console.error(err2);
+        }
+      } finally {
+        delete card.dataset.mcpLoading;
+      }
+
+      if (epoch !== fileSwitchEpoch || card.dataset.tlLoaded === '1') return;
+      try {
+        const tlRes = await MCP_BRIDGE.callTool(
+          'app_get_text_layer',
+          { page_idx: pageIdx, pdf_path: currentPdfPath || undefined, file: meta.file },
+          { priority: Math.max(0, priority - 1), signal },
+        );
+        if (epoch !== fileSwitchEpoch) return;
+        if (tlRes && Array.isArray(tlRes.runs)) {
+          const pInfo = {
+            w: tlRes.w || Number(card.dataset.pw) || 612,
+            h: tlRes.h || Number(card.dataset.ph) || 792,
+            runs: tlRes.runs,
+          };
+          mcpLoadedTextPages.set(pageIdx, pInfo);
+          populateSinglePageTextLayer(card, pInfo);
+          card.dataset.tlLoaded = '1';
+        }
+      } catch (err) {
+        if (err?.name !== 'AbortError') console.error(err);
+      }
+    }
+
+    function ensureMcpPageLoaded(pageNum, priority = 8) {
+      if (!IS_MCP_APP || !MCP_BRIDGE || !currentMeta) return;
+      const target = Math.max(1, Math.min(currentMeta.page_count, Number(pageNum) || 1));
+      const card = viewer.querySelector(`.page-card[data-page="${target}"]`);
+      if (!card) return;
+      if (card.dataset.mcpLoaded === '1' && card.dataset.tlLoaded === '1') return;
+      const signal = textAbortCtrl && !textAbortCtrl.signal.aborted ? textAbortCtrl.signal : null;
+      loadMcpPageAssets(card, target - 1, currentMeta, fileSwitchEpoch, priority, signal);
+    }
+
     async function loadTextLayer(expectedFile = currentFile, epoch = fileSwitchEpoch) {
+      if (IS_MCP_APP) return; // MCP App mode loads text layer on demand per page
       if (textAbortCtrl) textAbortCtrl.abort();
       textAbortCtrl = new AbortController();
       const signal = textAbortCtrl.signal;
@@ -3255,13 +4120,23 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const prevScrollRatio = viewer.scrollHeight > 0 ? prevScrollTop / viewer.scrollHeight : 0;
       const w = computePageWidth();
 
-      viewerInner.innerHTML = '';
+      if (IS_MCP_APP) {
+        revokeAllBlobUrls();
+        if (textAbortCtrl) textAbortCtrl.abort();
+        textAbortCtrl = new AbortController();
+      }
+      const pageSignal = textAbortCtrl ? textAbortCtrl.signal : null;
+
+      viewerInner.textContent = '';
+      const pagesArr = meta.pages || meta.sizes || [];
+      const cards = [];
       for (let i = 0; i < meta.page_count; i++) {
-        const p = meta.pages[i] || { w: 612, h: 792 };
+        const p = pagesArr[i] || { w: 612, h: 792 };
         const card = document.createElement('div');
         card.className = 'page-card';
         card.dataset.page = String(i + 1);
         card.dataset.pw = String(p.w);
+        card.dataset.ph = String(p.h);
         card.style.width = w + 'px';
         card.style.setProperty('--page-scale', (w / p.w).toFixed(5));
         card.style.aspectRatio = `${p.w} / ${p.h}`;
@@ -3270,7 +4145,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
         img.loading = i < 3 ? 'eager' : 'lazy';
         img.draggable = false;
         img.alt = `Page ${i + 1}`;
-        img.src = `/api/page/${i}.svg?file=${encodeURIComponent(meta.file)}&v=${encodeURIComponent(meta.mtime)}`;
+        if (!IS_MCP_APP) {
+          img.src = `/api/page/${i}.svg?file=${encodeURIComponent(meta.file)}&v=${encodeURIComponent(meta.mtime)}`;
+        }
 
         const overlay = document.createElement('div');
         overlay.className = 'page-overlay';
@@ -3288,10 +4165,33 @@ HTML_PAGE = r"""<!DOCTYPE html>
         card.appendChild(badge);
         attachPageInteraction(card, i + 1);
         viewerInner.appendChild(card);
+        cards.push(card);
       }
 
       renderPdfOverlays();
-      loadTextLayer(meta.file, epoch);
+      if (IS_MCP_APP) {
+        if (MCP_BRIDGE) {
+          if (typeof IntersectionObserver !== 'undefined') {
+            mcpPageObserver = new IntersectionObserver((entries) => {
+              entries.forEach(entry => {
+                if (!entry.isIntersecting) return;
+                const card = entry.target;
+                const idx = Number(card.dataset.page) - 1;
+                if (idx >= 0) {
+                  loadMcpPageAssets(card, idx, meta, epoch, 3, pageSignal);
+                }
+              });
+            }, { root: viewer, rootMargin: '420px 0px' });
+            cards.forEach(card => mcpPageObserver.observe(card));
+          }
+          // Eagerly kick off the first 2 pages with higher priority
+          for (let i = 0; i < Math.min(2, cards.length); i++) {
+            loadMcpPageAssets(cards[i], i, meta, epoch, 5, pageSignal);
+          }
+        }
+      } else {
+        loadTextLayer(meta.file, epoch);
+      }
 
       if (preserveScroll) {
         requestAnimationFrame(() => {
@@ -3432,6 +4332,28 @@ HTML_PAGE = r"""<!DOCTYPE html>
           postLockAction('toggle', [item.id]);
         };
         metaRow.appendChild(lockBtn);
+
+        if (IS_MCP_APP) {
+          const ctxBtn = document.createElement('button');
+          ctxBtn.className = 'mcp-action-btn mcp-ctx-btn' + (mcpCapabilities.updateModelContext ? '' : ' mcp-cap-hidden');
+          ctxBtn.textContent = '📎 对话';
+          ctxBtn.title = '将该段落上下文附加到下一条 Agent 对话';
+          ctxBtn.onclick = (e) => {
+            e.stopPropagation();
+            attachContextToAgent(item);
+          };
+          metaRow.appendChild(ctxBtn);
+
+          const msgBtn = document.createElement('button');
+          msgBtn.className = 'mcp-action-btn mcp-msg-btn' + (mcpCapabilities.message ? '' : ' mcp-cap-hidden');
+          msgBtn.textContent = '✨ 审校';
+          msgBtn.title = '发送该段落给 Agent 进行学术审校或润色';
+          msgBtn.onclick = (e) => {
+            e.stopPropagation();
+            sendReviewToAgent(item);
+          };
+          metaRow.appendChild(msgBtn);
+        }
 
         const heading = document.createElement('div');
         heading.className = 'zh-card-heading';
@@ -3617,8 +4539,64 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
     }
 
+    function applyLoadedMeta(meta, preserveScroll = false, isAuto = false, epoch = fileSwitchEpoch) {
+      if (!meta || epoch !== fileSwitchEpoch) return;
+      if (meta.pdf_path) currentPdfPath = meta.pdf_path;
+      if (meta.paper_dir) currentPaperDir = meta.paper_dir;
+      if (meta.tex_path) currentTexPath = meta.tex_path;
+      if (meta.tex_uri) {
+        currentTexUri = meta.tex_uri;
+      } else if (!currentZh?.tex_uri) {
+        currentTexUri = '';
+      }
+      updateOpenTexButton();
+      const filesChanged = !currentMeta || JSON.stringify(currentMeta.files || []) !== JSON.stringify(meta.files || []);
+      const changed = !currentMeta || currentMeta.file !== meta.file || currentMeta.mtime !== meta.mtime;
+      if (changed) {
+        liveDot.classList.add('updating');
+        currentMeta = meta;
+        indexMetaLinks(meta);
+        syncFileDropdown(meta);
+        pageCountEl.textContent = meta.page_count;
+        pageInput.max = meta.page_count;
+        updatedAt.textContent = meta.mtime_str;
+        buildPages(meta, preserveScroll, epoch);
+        if (isAuto) showToast(`已自动刷新 ${meta.file} (${meta.mtime_str})`);
+        setTimeout(() => liveDot.classList.remove('updating'), 400);
+      } else if (filesChanged) {
+        currentMeta.files = meta.files;
+        syncFileDropdown(meta);
+      }
+    }
+
+    function applyLoadedZh(zh, isAuto = false) {
+      if (!zh) return;
+      if (zh.tex_path) currentTexPath = zh.tex_path;
+      if (zh.tex_uri) {
+        currentTexUri = zh.tex_uri;
+      }
+      updateOpenTexButton();
+      const changed = !currentZh
+        || currentZh.mtime !== zh.mtime
+        || currentZh.pdf_mtime !== zh.pdf_mtime
+        || currentZh.locks_mtime !== zh.locks_mtime
+        || currentZh.available !== zh.available
+        || currentZh.file !== zh.file
+        || currentZh.error !== zh.error
+        || currentZh.note !== zh.note;
+      if (changed) {
+        const textUpdated = currentZh && currentZh.mtime !== zh.mtime;
+        currentZh = zh;
+        indexZhData(zh);
+        renderZhPane(true);
+        renderPdfOverlays();
+        if (isAuto && textUpdated && zh.available) showToast(`已同步更新中文对照 (${zh.mtime_str})`);
+      }
+    }
+
     async function loadMeta(preserveScroll = false, isAuto = false) {
       if (isAuto && (metaInFlight || document.hidden)) return;
+      if (IS_MCP_APP && !currentPdfPath && !currentFile) return;
       const epoch = fileSwitchEpoch;
       const reqFile = currentFile;
       if (!isAuto && metaAbortCtrl) metaAbortCtrl.abort();
@@ -3626,32 +4604,30 @@ HTML_PAGE = r"""<!DOCTYPE html>
       metaAbortCtrl = ctrl;
       metaInFlight = true;
       try {
-        const url = `/api/meta${reqFile ? '?file=' + encodeURIComponent(reqFile) : ''}`;
-        const res = await fetch(url, { cache: 'no-store', signal: ctrl.signal });
-        if (!res.ok) return;
-        const meta = await res.json();
-        if (epoch !== fileSwitchEpoch) return;
+        let meta;
+        if (IS_MCP_APP) {
+          if (!MCP_BRIDGE) return;
+          meta = await MCP_BRIDGE.callTool(
+            'app_get_meta',
+            {
+              pdf_path: currentPdfPath || undefined,
+              paper_dir: currentPaperDir || undefined,
+              file: reqFile || undefined,
+              zh_path: currentZhPath || undefined,
+            },
+            { priority: isAuto ? 1 : 9, signal: ctrl.signal },
+          );
+        } else {
+          const url = `/api/meta${reqFile ? '?file=' + encodeURIComponent(reqFile) : ''}`;
+          const res = await fetch(url, { cache: 'no-store', signal: ctrl.signal });
+          if (!res.ok) return;
+          meta = await res.json();
+        }
+        if (epoch !== fileSwitchEpoch || !meta) return;
         if (reqFile && meta.file !== reqFile && currentFile === reqFile) {
-          // Server fell back to default file when requested file no longer exists
           currentFile = meta.file;
         }
-        const filesChanged = !currentMeta || JSON.stringify(currentMeta.files || []) !== JSON.stringify(meta.files || []);
-        const changed = !currentMeta || currentMeta.file !== meta.file || currentMeta.mtime !== meta.mtime;
-        if (changed) {
-          liveDot.classList.add('updating');
-          currentMeta = meta;
-          indexMetaLinks(meta);
-          syncFileDropdown(meta);
-          pageCountEl.textContent = meta.page_count;
-          pageInput.max = meta.page_count;
-          updatedAt.textContent = meta.mtime_str;
-          buildPages(meta, preserveScroll, epoch);
-          if (isAuto) showToast(`已自动刷新 ${meta.file} (${meta.mtime_str})`);
-          setTimeout(() => liveDot.classList.remove('updating'), 400);
-        } else if (filesChanged) {
-          currentMeta.files = meta.files;
-          syncFileDropdown(meta);
-        }
+        applyLoadedMeta(meta, preserveScroll, isAuto, epoch);
       } catch (e) {
         if (e?.name !== 'AbortError') console.error(e);
       } finally {
@@ -3661,6 +4637,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     async function loadZh(isAuto = false) {
       if (isAuto && (zhInFlight || document.hidden)) return;
+      if (IS_MCP_APP && !currentPdfPath && !currentFile) return;
       const epoch = fileSwitchEpoch;
       const reqFile = currentFile;
       if (!isAuto && zhAbortCtrl) zhAbortCtrl.abort();
@@ -3668,27 +4645,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
       zhAbortCtrl = ctrl;
       zhInFlight = true;
       try {
-        const url = `/api/zh${reqFile ? '?file=' + encodeURIComponent(reqFile) : ''}`;
-        const res = await fetch(url, { cache: 'no-store', signal: ctrl.signal });
-        if (!res.ok) return;
-        const zh = await res.json();
-        if (epoch !== fileSwitchEpoch) return;
-        const changed = !currentZh
-          || currentZh.mtime !== zh.mtime
-          || currentZh.pdf_mtime !== zh.pdf_mtime
-          || currentZh.locks_mtime !== zh.locks_mtime
-          || currentZh.available !== zh.available
-          || currentZh.file !== zh.file
-          || currentZh.error !== zh.error
-          || currentZh.note !== zh.note;
-        if (changed) {
-          const textUpdated = currentZh && currentZh.mtime !== zh.mtime;
-          currentZh = zh;
-          indexZhData(zh);
-          renderZhPane(true);
-          renderPdfOverlays();
-          if (isAuto && textUpdated && zh.available) showToast(`已同步更新中文对照 (${zh.mtime_str})`);
+        let zh;
+        if (IS_MCP_APP) {
+          if (!MCP_BRIDGE) return;
+          zh = await MCP_BRIDGE.callTool(
+            'app_get_zh',
+            {
+              pdf_path: currentPdfPath || undefined,
+              file: reqFile || undefined,
+              zh_path: currentZhPath || undefined,
+            },
+            { priority: isAuto ? 1 : 9, signal: ctrl.signal },
+          );
+        } else {
+          const url = `/api/zh${reqFile ? '?file=' + encodeURIComponent(reqFile) : ''}`;
+          const res = await fetch(url, { cache: 'no-store', signal: ctrl.signal });
+          if (!res.ok) return;
+          zh = await res.json();
         }
+        if (epoch !== fileSwitchEpoch || !zh) return;
+        applyLoadedZh(zh, isAuto);
       } catch (e) {
         if (e?.name !== 'AbortError') console.error(e);
       } finally {
@@ -3700,6 +4676,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       if (!currentMeta) return;
       const target = Math.max(1, Math.min(currentMeta.page_count, Number(n) || 1));
       currentPage = target;
+      ensureMcpPageLoaded(target, 8);
       const el = viewer.querySelector(`.page-card[data-page="${target}"]`);
       if (el) {
         el.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -3721,6 +4698,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
       if (best !== currentPage) {
         currentPage = best;
+        ensureMcpPageLoaded(best, 5);
         highlightZhCards(true);
       }
     }
@@ -3732,9 +4710,48 @@ HTML_PAGE = r"""<!DOCTYPE html>
         searchDrawer.textContent = '';
         return;
       }
-      const res = await fetch(`/api/search?file=${encodeURIComponent(currentFile)}&q=${encodeURIComponent(q)}`);
-      if (!res.ok) return;
-      const data = await res.json();
+      let data = { matches: [] };
+      if (IS_MCP_APP) {
+        if (!MCP_BRIDGE) return;
+        const qLow = q.toLowerCase();
+        try {
+          if (currentMeta && mcpLoadedTextPages.size < currentMeta.page_count) {
+            const fullTl = await MCP_BRIDGE.callTool(
+              'app_get_text_layer',
+              { pdf_path: currentPdfPath || undefined, file: currentFile || undefined },
+              8,
+            );
+            if (fullTl && Array.isArray(fullTl.pages)) {
+              fullTl.pages.forEach((pg, idx) => mcpLoadedTextPages.set(idx, pg));
+            }
+          }
+        } catch (_) {}
+        const matches = [];
+        const totalPages = currentMeta ? currentMeta.page_count : mcpLoadedTextPages.size;
+        for (let idx = 0; idx < totalPages; idx++) {
+          const pg = mcpLoadedTextPages.get(idx);
+          if (!pg || !Array.isArray(pg.runs)) continue;
+          const fullTxt = pg.runs.map(r => r[4] || '').join(' ');
+          const low = fullTxt.toLowerCase();
+          const pos = low.indexOf(qLow);
+          if (pos !== -1) {
+            let count = 0;
+            let curPos = pos;
+            while (curPos !== -1) {
+              count += 1;
+              curPos = low.indexOf(qLow, curPos + qLow.length);
+            }
+            const start = Math.max(0, pos - 40);
+            const end = Math.min(fullTxt.length, pos + q.length + 60);
+            matches.push({ page: idx + 1, count, snippet: fullTxt.slice(start, end).replace(/\s+/g, ' ').trim() });
+          }
+        }
+        data = { matches };
+      } else {
+        const res = await fetch(`/api/search?file=${encodeURIComponent(currentFile)}&q=${encodeURIComponent(q)}`);
+        if (!res.ok) return;
+        data = await res.json();
+      }
       searchDrawer.classList.add('open');
       searchDrawer.textContent = '';
       if (!data.matches || !data.matches.length) {
@@ -3798,11 +4815,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
     });
 
     fileSelect.addEventListener('change', () => {
+      const nextFile = fileSelect.value;
+      if (IS_MCP_APP) {
+        if (MCP_BRIDGE) {
+          selectPaperViaMcp({ paper_dir: currentPaperDir || undefined, file: nextFile });
+        }
+        return;
+      }
       fileSwitchEpoch += 1;
       if (metaAbortCtrl) metaAbortCtrl.abort();
       if (zhAbortCtrl) zhAbortCtrl.abort();
       if (textAbortCtrl) textAbortCtrl.abort();
-      currentFile = fileSelect.value;
+      currentFile = nextFile;
       currentMeta = null;
       currentZh = null;
       currentPage = 1;
@@ -3817,6 +4841,68 @@ HTML_PAGE = r"""<!DOCTYPE html>
       hoverPill.style.display = 'none';
       loadMeta(false, false);
       loadZh(false);
+    });
+    if (openPaperPickerBtn) {
+      openPaperPickerBtn.onclick = () => showEmptyGuide();
+    }
+    if (guideCloseBtn) {
+      guideCloseBtn.onclick = () => hideEmptyGuide();
+    }
+    if (guideOpenBtn) {
+      guideOpenBtn.onclick = () => {
+        const raw = (guidePdfInput?.value || '').trim();
+        const zhRaw = (guideZhInput?.value || '').trim();
+        if (!raw) {
+          showToast('请输入本地 PDF 路径或论文目录');
+          return;
+        }
+        const args = {};
+        if (/\.pdf$/i.test(raw)) {
+          args.pdf_path = raw;
+        } else {
+          args.paper_dir = raw;
+        }
+        if (zhRaw) args.zh_path = zhRaw;
+        selectPaperViaMcp(args);
+      };
+    }
+    if (guidePdfInput) {
+      guidePdfInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && guideOpenBtn) guideOpenBtn.click();
+      });
+    }
+    if (openTexBtn) {
+      openTexBtn.onclick = async () => {
+        if (!IS_MCP_APP || !MCP_BRIDGE || !currentTexUri) return;
+        const res = await MCP_BRIDGE.openFileInAuxPane(currentTexUri);
+        if (res && res.ok) {
+          showToast('已在侧栏打开 .tex 源码');
+        } else if (res && res.unsupported) {
+          auxPaneUnsupported = true;
+          updateOpenTexButton();
+        } else {
+          showToast('当前视图无法在侧栏打开源码');
+        }
+      };
+    }
+    if (selAttachBtn) {
+      selAttachBtn.onclick = (e) => {
+        e.stopPropagation();
+        if (!lastSelectionPayload) return;
+        attachContextToAgent(lastSelectionPayload.item, lastSelectionPayload.snippet);
+      };
+    }
+    if (selReviewBtn) {
+      selReviewBtn.onclick = (e) => {
+        e.stopPropagation();
+        if (!lastSelectionPayload) return;
+        sendReviewToAgent(lastSelectionPayload.item, lastSelectionPayload.snippet);
+      };
+    }
+    document.addEventListener('mousedown', (e) => {
+      if (selActionBar && selActionBar.classList.contains('open') && !selActionBar.contains(e.target)) {
+        hideSelectionActionBar();
+      }
     });
     document.getElementById('prevBtn').onclick = () => jumpToPage(Number(pageInput.value) - 1);
     document.getElementById('nextBtn').onclick = () => jumpToPage(Number(pageInput.value) + 1);
@@ -3834,6 +4920,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       zoomMode = 'fit';
       applyZoom();
       viewer.scrollLeft = 0;
+      scheduleSaveUiState();
     };
 
     viewer.addEventListener('wheel', (e) => {
@@ -3938,7 +5025,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
       // If user drag-selected English text on the PDF, keep selection intact for Ctrl+C AND sync matching Chinese sentence!
       const sel = window.getSelection();
       if (sel && !sel.isCollapsed && sel.rangeCount > 0 && sel.toString().trim().length > 0) {
+        const selText = sel.toString().trim();
         const range = sel.getRangeAt(0);
+        if (zhList && zhList.contains(range.commonAncestorContainer)) {
+          const cardEl = range.commonAncestorContainer.nodeType === 1
+            ? range.commonAncestorContainer.closest?.('.zh-card')
+            : range.commonAncestorContainer.parentElement?.closest?.('.zh-card');
+          const matchedItem = cardEl ? itemById[cardEl.dataset.id] : (selectedZhId ? itemById[selectedZhId] : null);
+          showSelectionActionBar(range, { item: matchedItem || null, snippet: selText });
+          return;
+        }
         if (viewer.contains(range.commonAncestorContainer)) {
           suppressNextPdfClick = true;
           setTimeout(() => { suppressNextPdfClick = false; }, 180);
@@ -3950,6 +5046,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
               }
             } catch (_) {}
           });
+          let matchedItemObj = null;
           if (hitSpans.length) {
             const zhSet = new Set();
             const enSet = new Set();
@@ -3987,6 +5084,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 enIndices: Array.from(enSet).sort((a, b) => a - b),
               };
               const targetObj = itemById[targetItem];
+              matchedItemObj = targetObj || null;
               if (!zhVisible) {
                 zhVisible = true;
                 applyLayoutState();
@@ -3998,15 +5096,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
               }
               if (targetObj && zhFilterMode === 'todo' && !targetObj.is_todo) {
                 zhFilterMode = 'all';
-                localStorage.setItem('paper_zh_filter', 'all');
+                safeStorageSet('paper_zh_filter', 'all');
+                scheduleSaveUiState();
                 needRerender = true;
               } else if (targetObj && zhFilterMode === 'locked' && !lockedSet.has(targetObj.id)) {
                 zhFilterMode = 'all';
-                localStorage.setItem('paper_zh_filter', 'all');
+                safeStorageSet('paper_zh_filter', 'all');
+                scheduleSaveUiState();
                 needRerender = true;
               } else if (targetObj && zhFilterMode === 'page' && !itemMatchesPage(targetObj, currentPage)) {
                 zhFilterMode = 'all';
-                localStorage.setItem('paper_zh_filter', 'all');
+                safeStorageSet('paper_zh_filter', 'all');
+                scheduleSaveUiState();
                 needRerender = true;
               }
               if (needRerender) {
@@ -4024,6 +5125,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
               }
             }
           }
+          showSelectionActionBar(range, { item: matchedItemObj, snippet: selText });
         }
       }
     });
@@ -4042,7 +5144,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       if (!btn) return;
       btn.onclick = () => {
         zhFilterMode = btn.dataset.filter;
-        localStorage.setItem('paper_zh_filter', zhFilterMode);
+        safeStorageSet('paper_zh_filter', zhFilterMode);
+        scheduleSaveUiState();
         renderZhPane(false);
       };
     });
@@ -4050,7 +5153,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       pdfLockMarkBtn.classList.toggle('active', showPdfLockMarks);
       pdfLockMarkBtn.onclick = () => {
         showPdfLockMarks = !showPdfLockMarks;
-        localStorage.setItem('paper_pdf_lock_marks', showPdfLockMarks ? '1' : '0');
+        safeStorageSet('paper_pdf_lock_marks', showPdfLockMarks ? '1' : '0');
+        scheduleSaveUiState();
         pdfLockMarkBtn.classList.toggle('active', showPdfLockMarks);
         renderPdfLockOverlays();
         showToast(showPdfLockMarks ? '已开启左侧 PDF 细锁边条' : '已隐藏左侧 PDF 锁标（保持纯净 PDF 排版视图）');
@@ -4073,13 +5177,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
     autoSyncBtn.onclick = () => {
       autoFollow = !autoFollow;
-      localStorage.setItem('paper_zh_follow', autoFollow ? '1' : '0');
+      safeStorageSet('paper_zh_follow', autoFollow ? '1' : '0');
+      scheduleSaveUiState();
       autoSyncBtn.classList.toggle('active', autoFollow);
       showToast(autoFollow ? '已开启滚动跟随' : '已暂停滚动跟随');
     };
     zhFilterInput.addEventListener('input', () => renderZhPane(false));
     document.getElementById('reloadBtn').onclick = () => {
       fileSwitchEpoch += 1;
+      if (metaAbortCtrl) metaAbortCtrl.abort();
+      if (zhAbortCtrl) zhAbortCtrl.abort();
+      if (textAbortCtrl) textAbortCtrl.abort();
       currentMeta = null;
       currentZh = null;
       loadMeta(true, false);
@@ -4096,22 +5204,103 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     function scheduleNextPoll() {
       if (pollTimer) clearTimeout(pollTimer);
+      const intervalMs = IS_MCP_APP ? 3000 : 1500;
       pollTimer = setTimeout(async () => {
-        if (!document.hidden) {
+        if (!document.hidden && (!IS_MCP_APP || currentPdfPath || currentFile)) {
           await Promise.all([loadMeta(true, true), loadZh(true)]);
         }
         scheduleNextPoll();
-      }, 1500);
+      }, intervalMs);
     }
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden) {
+      if (!document.hidden && (!IS_MCP_APP || currentPdfPath || currentFile)) {
         loadMeta(true, true);
         loadZh(true);
       }
     });
 
-    applyLayoutState();
-    Promise.all([loadMeta(false, false), loadZh(false)]).finally(scheduleNextPoll);
+    applyLayoutState(false);
+    if (IS_MCP_APP) {
+      if (!MCP_BRIDGE) {
+        showEmptyGuide('未检测到 MCP 桥接模块，请在 Antigravity 中通过 open_paper 打开。');
+      } else {
+        let receivedInitialToolInput = false;
+        let receivedInitialToolResult = false;
+        let startupFallbackTimer = null;
+        const cancelStartupFallback = () => {
+          if (startupFallbackTimer) {
+            clearTimeout(startupFallbackTimer);
+            startupFallbackTimer = null;
+          }
+        };
+        MCP_BRIDGE.onToolInput((params) => {
+          receivedInitialToolInput = true;
+          cancelStartupFallback();
+          const args = params?.arguments || {};
+          if (args.pdf_path || args.paper_dir) {
+            showToast('正在加载论文...');
+          }
+        });
+        MCP_BRIDGE.onToolResult((result) => {
+          receivedInitialToolResult = true;
+          cancelStartupFallback();
+          const sc = result && result.structuredContent !== undefined ? result.structuredContent : result;
+          applyOpenPaperPayload(sc);
+        });
+        MCP_BRIDGE.onHostContextChanged(() => {
+          applyCapabilityVisibility();
+        });
+        MCP_BRIDGE.ready.then(() => {
+          applyCapabilityVisibility();
+          scheduleNextPoll();
+          if (receivedInitialToolInput || receivedInitialToolResult || currentMeta) return;
+          startupFallbackTimer = setTimeout(async () => {
+            startupFallbackTimer = null;
+            if (receivedInitialToolInput || receivedInitialToolResult || currentMeta) return;
+            try {
+              const st = await MCP_BRIDGE.callTool('app_get_state', {}, 8);
+              if (receivedInitialToolInput || receivedInitialToolResult || currentMeta) return;
+              if (st) {
+                if (Array.isArray(st.recent_papers)) recentPapers = st.recent_papers;
+                if (st.ui_state) hydrateUiState(st.ui_state);
+                if (st.last_pdf) {
+                  try {
+                    const payload = await MCP_BRIDGE.callTool(
+                      'app_select_paper',
+                      { pdf_path: st.last_pdf, zh_path: st.last_zh || undefined },
+                      8,
+                    );
+                    if (receivedInitialToolInput || receivedInitialToolResult || currentMeta) return;
+                    if (payload && payload.has_paper !== false && !payload.error) {
+                      await applyOpenPaperPayload(payload);
+                    } else {
+                      showEmptyGuide();
+                    }
+                  } catch (_) {
+                    if (!receivedInitialToolInput && !receivedInitialToolResult && !currentMeta) {
+                      showEmptyGuide();
+                    }
+                  }
+                } else {
+                  showEmptyGuide();
+                }
+              } else {
+                showEmptyGuide();
+              }
+            } catch (_) {
+              if (!receivedInitialToolInput && !receivedInitialToolResult && !currentMeta) {
+                showEmptyGuide();
+              }
+            }
+          }, 350);
+        }).catch((err) => {
+          console.error('[chengmen] MCP bridge connect failed:', err);
+          showEmptyGuide('未检测到 MCP 宿主连接，请在 Antigravity 中通过 open_paper 打开。');
+        });
+      }
+    } else {
+      Promise.all([loadMeta(false, false), loadZh(false)]).finally(scheduleNextPoll);
+    }
   </script>
 </body>
 </html>
@@ -4175,11 +5364,7 @@ class ViewerHandler(http.server.BaseHTTPRequestHandler):
 
     def _render_html_page(self) -> tuple[bytes, dict[str, str]]:
         nonce = secrets.token_urlsafe(16)
-        html = (
-            HTML_PAGE
-            .replace("__CSP_NONCE__", nonce)
-            .replace("__VIEWER_SESSION_TOKEN__", json.dumps(SESSION_TOKEN))
-        )
+        html = render_viewer_html(mode="http", viewer_token=SESSION_TOKEN, csp_nonce=nonce)
         csp = (
             f"default-src 'self'; "
             f"script-src 'nonce-{nonce}'; "

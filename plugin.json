@@ -1,0 +1,21 @@
+{
+  "name": "chengmen-paper-viewer",
+  "displayName": "Chengmen Paper Viewer",
+  "version": "0.3.0",
+  "description": "Live bilingual vector-SVG LaTeX paper viewer and paragraph-lock guard for Antigravity — inspect English PDFs alongside synchronized Chinese companions in the side pane or sidebar.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Open my LaTeX paper PDF in Chengmen Paper Viewer and sync its Chinese companion",
+    "在 Chengmen Paper Viewer 中打开当前论文并查看已锁定段落",
+    "Verify bilingual companion anchors and LaTeX source alignment for this paper"
+  ],
+  "author": {
+    "name": "Jiangtao Ding",
+    "url": "https://github.com/JiangtaoDing"
+  },
+  "homepage": "https://github.com/JiangtaoDing/chengmen-paper-viewer",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/JiangtaoDing/chengmen-paper-viewer"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "chengmen-paper-lock": {
+    "PreToolUse": [
+      {
+        "matcher": "edit_file|write_file|run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python paper_lock.py --hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
